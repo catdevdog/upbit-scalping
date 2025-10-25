@@ -1,0 +1,31 @@
+{
+  "name": "upbit-auto-trader",
+  "version": "1.0.0",
+  "description": "Upbit Automated Trading Bot with Adaptive Strategy",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "dotenv -e .env.example -- node src/index.js",
+    "start:scalping": "dotenv -e .env.scalping -- node src/index.js"
+  },
+  "keywords": [
+    "upbit",
+    "crypto",
+    "trading",
+    "bot",
+    "scalping"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "cross-env": "^7.0.3",
+    "dotenv": "^16.3.1",
+    "jsonwebtoken": "^9.0.2",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "dotenv-cli": "^10.0.0",
+    "nodemon": "^3.0.1"
+  }
+}
