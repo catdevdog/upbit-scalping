@@ -1,7 +1,8 @@
 import upbitAPI from "../api/upbit.js";
-import { calculateRSI } from "../utils/indicators.js";
+import { calculateRSI, calculateRVOL } from "../utils/indicators.js";
 import { calculateAverage, log } from "../utils/helpers.js";
 import cacheManager from "../utils/cache.js";
+import config from "../config/env.js";
 
 /**
  * ⚡ 스캘핑 전용 RSI 전략 (1분봉, 민감)
@@ -69,7 +70,7 @@ export async function checkScalpingRSI(market) {
 }
 
 /**
- * ⚡ 스캘핑 전용 거래량 폭증 감지 (1분봉)
+ * ⚡ 스캘핑 전용 거래량 폭증 감지 (1분봉) + RVOL
  */
 export async function checkScalpingVolume(market) {
   try {
@@ -90,6 +91,10 @@ export async function checkScalpingVolume(market) {
         .reduce((sum, c) => sum + c.candle_acc_trade_volume, 0) / 5;
 
     const volumeRatio = currentVolume / avgVolume;
+
+    // ✅ RVOL 계산
+    const rvol = calculateRVOL(currentVolume, candles.slice(1));
+
     const currentPrice = candles[0].trade_price;
     const prevPrice = candles[1].trade_price;
     const priceChange = ((currentPrice - prevPrice) / prevPrice) * 100;
@@ -110,6 +115,12 @@ export async function checkScalpingVolume(market) {
     } else if (volumeRatio >= 1.5) {
       score += 15;
       signals.push("거래량 상승");
+    }
+
+    // ✅ RVOL 보너스 (1.5 이상)
+    if (rvol >= 1.5) {
+      score += 10;
+      signals.push(`RVOL ${rvol.toFixed(2)}x`);
     }
 
     // 가격 상승 동반
@@ -141,7 +152,7 @@ export async function checkScalpingVolume(market) {
       signal: shouldBuy ? "BUY" : "NONE",
       score,
       reason: signals.join(", ") || "조건 미충족",
-      data: { volumeRatio, priceChange },
+      data: { volumeRatio, rvol, priceChange },
     };
   } catch (error) {
     log("error", "[Scalping Volume] 실행 실패", error.message);
@@ -150,7 +161,7 @@ export async function checkScalpingVolume(market) {
 }
 
 /**
- * ⚡ 스캘핑 전용 호가창 분석 (1~3호가 집중)
+ * ✅ 스캘핑 전용 호가창 분석 (스프레드, 불균형, 깊이)
  */
 export async function checkScalpingOrderbook(market) {
   try {
@@ -161,71 +172,85 @@ export async function checkScalpingOrderbook(market) {
     );
 
     if (!orderbook || !orderbook.orderbook_units) {
-      return { signal: "NONE", score: 0, reason: "데이터 부족" };
+      return { signal: "NONE", score: 0, reason: "호가창 데이터 없음" };
     }
 
     const units = orderbook.orderbook_units;
-
-    // 1~3호가 집중 분석
-    const topBidSize = units
-      .slice(0, 3)
-      .reduce((sum, u) => sum + u.bid_size, 0);
-    const topAskSize = units
-      .slice(0, 3)
-      .reduce((sum, u) => sum + u.ask_size, 0);
-
-    // ✅ topAskSize = 0 예외 처리
-    if (topAskSize === 0) {
-      return { signal: "NONE", score: 0, reason: "매도 호가 없음" };
-    }
-
-    const ratio = topBidSize / topAskSize;
-
-    // 1호가 스프레드
-    const firstBid = units[0].bid_price;
-    const firstAsk = units[0].ask_price;
-    const spread = ((firstAsk - firstBid) / firstBid) * 100;
-
-    // 1호가 체결 강도
-    const bidStrength = units[0].bid_size / topBidSize;
+    const ask1 = units[0].ask_price; // 최우선 매도호가
+    const bid1 = units[0].bid_price; // 최우선 매수호가
 
     let score = 0;
     const signals = [];
 
-    // 매수 압력
-    if (ratio >= 4.0) {
-      score += 40;
-      signals.push("압도적 매수세");
-    } else if (ratio >= 3.5) {
-      score += 35;
-      signals.push("강한 매수세");
-    } else if (ratio >= 3.0) {
-      score += 30;
-      signals.push("매수 우세");
-    } else if (ratio >= 2.5) {
-      score += 25;
-      signals.push("매수 증가");
-    }
+    // === 1. 스프레드 체크 ===
+    const spread = ask1 - bid1;
+    const spreadPercent = (spread / bid1) * 100;
+    const tickSize = bid1 * 0.0001; // 대략적인 틱 크기 (0.01%)
+    const spreadTicks = spread / tickSize;
 
-    // 좁은 스프레드 (빠른 체결)
-    if (spread < 0.03) {
+    if (spreadTicks <= config.MAX_SPREAD_TICKS) {
       score += 20;
-      signals.push("초박 스프레드");
-    } else if (spread < 0.05) {
+      signals.push(`좁은 스프레드 ${spreadTicks.toFixed(1)}틱`);
+    } else if (spreadTicks <= config.MAX_SPREAD_TICKS * 2) {
+      score += 10;
+      signals.push(`보통 스프레드 ${spreadTicks.toFixed(1)}틱`);
+    } else {
+      score -= 10;
+      signals.push(`⚠️ 넓은 스프레드 ${spreadTicks.toFixed(1)}틱`);
+    }
+
+    // === 2. 호가 불균형 (Imbalance) ===
+    let bidDepth = 0;
+    let askDepth = 0;
+    const depth = Math.min(config.ORDERBOOK_DEPTH, units.length);
+
+    for (let i = 0; i < depth; i++) {
+      bidDepth += units[i].bid_size;
+      askDepth += units[i].ask_size;
+    }
+
+    const totalDepth = bidDepth + askDepth;
+    const imbalance = totalDepth > 0 ? (bidDepth - askDepth) / totalDepth : 0;
+
+    if (imbalance >= config.MIN_IMBALANCE) {
+      score += 30;
+      signals.push(`매수우세 ${(imbalance * 100).toFixed(1)}%`);
+    } else if (imbalance >= config.MIN_IMBALANCE * 0.5) {
+      score += 20;
+      signals.push(`매수압력 ${(imbalance * 100).toFixed(1)}%`);
+    } else if (imbalance <= -config.MIN_IMBALANCE) {
+      score -= 20;
+      signals.push(`⚠️ 매도우세 ${(imbalance * 100).toFixed(1)}%`);
+    }
+
+    // === 3. 베스트 호가 잔량 ===
+    const bid1Size = units[0].bid_size;
+    const ask1Size = units[0].ask_size;
+    const bid1Ratio = bid1Size / (bid1Size + ask1Size);
+
+    if (bid1Ratio >= 0.7) {
       score += 15;
-      signals.push("좁은 스프레드");
-    } else if (spread < 0.1) {
+      signals.push(`베스트호가 매수강함 ${(bid1Ratio * 100).toFixed(0)}%`);
+    } else if (bid1Ratio >= 0.6) {
       score += 10;
-      signals.push("보통 스프레드");
+      signals.push(`베스트호가 매수우세 ${(bid1Ratio * 100).toFixed(0)}%`);
     }
 
-    // 1호가 집중도
-    if (bidStrength > 0.6) {
+    // === 4. 호가 깊이 (5~10호가 누적) ===
+    const midDepth = Math.floor(depth / 2);
+    const nearBidDepth = units
+      .slice(0, midDepth)
+      .reduce((sum, u) => sum + u.bid_size, 0);
+    const farBidDepth = units
+      .slice(midDepth, depth)
+      .reduce((sum, u) => sum + u.bid_size, 0);
+
+    if (nearBidDepth > farBidDepth * 1.3) {
       score += 10;
-      signals.push("1호가 집중");
+      signals.push("근접 매수벽 강함");
     }
 
-    const shouldBuy = score >= 35;
+    const shouldBuy = score >= 25;
 
     if (shouldBuy) {
       log(
@@ -238,7 +263,7 @@ export async function checkScalpingOrderbook(market) {
       signal: shouldBuy ? "BUY" : "NONE",
       score,
       reason: signals.join(", ") || "조건 미충족",
-      data: { ratio, spread, bidStrength },
+      data: { spread, spreadPercent, imbalance, bid1Ratio },
     };
   } catch (error) {
     log("error", "[Scalping Orderbook] 실행 실패", error.message);
@@ -247,13 +272,13 @@ export async function checkScalpingOrderbook(market) {
 }
 
 /**
- * ⚡ 스캘핑 전용 캔들 패턴 (1분봉)
+ * ✅ 스캘핑 전용 캔들 패턴 (1분봉) - 단순화
  */
 export async function checkScalpingCandle(market) {
   try {
     const candles = await cacheManager.get(
       `candles_1m_${market}_candle`,
-      () => upbitAPI.getCandles(market, 5, "minutes", 1),
+      () => upbitAPI.getCandles(market, 20, "minutes", 1),
       1000
     );
 
@@ -346,5 +371,57 @@ export async function checkScalpingCandle(market) {
   } catch (error) {
     log("error", "[Scalping Candle] 실행 실패", error.message);
     return { signal: "NONE", score: 0, reason: "실행 실패" };
+  }
+}
+
+/**
+ * ✅ ATR 변동성 필터 - 진입 전 체크 (선택적)
+ */
+export async function checkATRFilter(market) {
+  try {
+    const candles = await cacheManager.get(
+      `candles_1m_${market}_atr`,
+      () => upbitAPI.getCandles(market, 20, "minutes", 1),
+      1000
+    );
+
+    if (candles.length < 10) {
+      return { pass: true, reason: "데이터 부족", atr: 0 };
+    }
+
+    // 단순 변동성 계산 (ATR 대신)
+    const recentCandles = candles.slice(0, 5);
+    let totalRange = 0;
+
+    for (const candle of recentCandles) {
+      const range =
+        ((candle.high_price - candle.low_price) / candle.low_price) * 100;
+      totalRange += range;
+    }
+
+    const avgRange = totalRange / recentCandles.length;
+
+    if (avgRange < config.MIN_ATR_THRESHOLD) {
+      log(
+        "warn",
+        `⚠️ 변동성 부족 (${avgRange.toFixed(2)}% < ${
+          config.MIN_ATR_THRESHOLD
+        }%) - 진입 금지`
+      );
+      return {
+        pass: false,
+        reason: `변동성 부족 ${avgRange.toFixed(2)}%`,
+        atr: avgRange,
+      };
+    }
+
+    return {
+      pass: true,
+      reason: `변동성 충분 ${avgRange.toFixed(2)}%`,
+      atr: avgRange,
+    };
+  } catch (error) {
+    log("error", "[ATR Filter] 실행 실패", error.message);
+    return { pass: true, reason: "필터 실패", atr: 0 }; // 에러 시 통과
   }
 }

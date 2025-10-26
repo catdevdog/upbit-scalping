@@ -5,8 +5,7 @@
   "main": "src/index.js",
   "type": "module",
   "scripts": {
-    "start": "dotenv -e .env.example -- node src/index.js",
-    "start:scalping": "dotenv -e .env.scalping -- node src/index.js"
+    "start": "dotenv -e .env -- node src/index.js"
   },
   "keywords": [
     "upbit",

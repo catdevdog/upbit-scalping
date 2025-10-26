@@ -75,6 +75,11 @@ class Config {
     return this.UPBIT_MAKER_FEE + this.UPBIT_TAKER_FEE; // 0.1%
   }
 
+  // === ✅ 슬리피지 설정 (스캘핑용) ===
+  get EXPECTED_SLIPPAGE() {
+    return this.getNumber("EXPECTED_SLIPPAGE", 0.05); // 0.05% 예상 슬리피지
+  }
+
   // === 전략 활성화 (스캘핑 전용) ===
   get STRATEGY_RSI() {
     return this.getBoolean("STRATEGY_RSI", true);
@@ -83,7 +88,7 @@ class Config {
     return this.getBoolean("STRATEGY_VOLUME", true);
   }
   get STRATEGY_ORDERBOOK() {
-    return this.getBoolean("STRATEGY_ORDERBOOK", false);
+    return this.getBoolean("STRATEGY_ORDERBOOK", true);
   }
   get STRATEGY_CANDLE() {
     return this.getBoolean("STRATEGY_CANDLE", true);
@@ -94,20 +99,20 @@ class Config {
     return "aggressive";
   }
 
-  // === 진입 설정 ===
+  // === 진입 설정 (✅ 완화) ===
   get ENTRY_SCORE_THRESHOLD() {
-    return this.getNumber("ENTRY_SCORE_THRESHOLD", 40);
+    return this.getNumber("ENTRY_SCORE_THRESHOLD", 30); // ✅ 40 → 30
   }
   get MIN_SIGNALS() {
     return this.getNumber("MIN_SIGNALS", 1);
   }
 
-  // === 시장 필터 ===
+  // === 시장 필터 (✅ 완화) ===
   get MARKET_FILTER_ENABLED() {
     return this.getBoolean("MARKET_FILTER_ENABLED", true);
   }
   get MARKET_FAVORABLE_THRESHOLD() {
-    return this.getNumber("MARKET_FAVORABLE_THRESHOLD", 50);
+    return this.getNumber("MARKET_FAVORABLE_THRESHOLD", 40); // ✅ 50 → 40
   }
   get BLOCK_HIGH_VOLATILITY() {
     return this.getBoolean("BLOCK_HIGH_VOLATILITY", true);
@@ -116,15 +121,20 @@ class Config {
     return this.getNumber("VOLATILITY_THRESHOLD", 2.0);
   }
 
-  // === 손절/익절 ===
+  // === ✅ ATR 변동성 필터 (완화) ===
+  get MIN_ATR_THRESHOLD() {
+    return this.getNumber("MIN_ATR_THRESHOLD", 0.2); // ✅ 0.3 → 0.2
+  }
+
+  // === 손절/익절 (✅ 스캘핑 최적화) ===
   get STOP_LOSS_PERCENT() {
-    return this.getNumber("STOP_LOSS_PERCENT", -0.8);
+    return this.getNumber("STOP_LOSS_PERCENT", -0.5); // ✅ 타이트한 손절
   }
   get TAKE_PROFIT_PERCENT() {
     return this.getNumber("TAKE_PROFIT_PERCENT", 0.8);
   }
   get QUICK_PROFIT_PERCENT() {
-    return this.getNumber("QUICK_PROFIT_PERCENT", 0.5);
+    return this.getNumber("QUICK_PROFIT_PERCENT", 0.8); // ✅ 0.6 → 0.8
   }
   get TRAILING_STOP_ENABLED() {
     return this.getBoolean("TRAILING_STOP_ENABLED", true);
@@ -138,13 +148,13 @@ class Config {
     return this.getNumber("MAX_HOLDING_TIME", 180);
   }
   get PROFIT_TIME_LIMIT() {
-    return this.getNumber("PROFIT_TIME_LIMIT", 120); // ✅ 90초 → 120초로 증가
+    return this.getNumber("PROFIT_TIME_LIMIT", 120);
   }
   get SIDEWAYS_TIME_LIMIT() {
     return this.getNumber("SIDEWAYS_TIME_LIMIT", 60);
   }
 
-  // === ✅ 모멘텀 기반 청산 (수수료 고려 상향) ===
+  // === ✅ 모멘텀 기반 청산 (수수료+슬리피지 고려) ===
   get MOMENTUM_CHECK_PERIOD() {
     return this.getNumber("MOMENTUM_CHECK_PERIOD", 20);
   }
@@ -152,12 +162,10 @@ class Config {
     return this.getNumber("MOMENTUM_THRESHOLD", 0.08);
   }
   get SIDEWAYS_EXIT_THRESHOLD() {
-    // ✅ 0.25% → 0.5%로 상향 (수수료 0.1% 고려)
-    return this.getNumber("SIDEWAYS_EXIT_THRESHOLD", 0.5);
+    return this.getNumber("SIDEWAYS_EXIT_THRESHOLD", 0.6); // ✅ 수수료+슬리피지 고려
   }
   get MIN_PROFIT_FOR_TIME_EXIT() {
-    // ✅ 시간 기반 청산 최소 수익률 (수수료 + 최소 이익)
-    return this.getNumber("MIN_PROFIT_FOR_TIME_EXIT", 0.4);
+    return this.getNumber("MIN_PROFIT_FOR_TIME_EXIT", 0.6); // ✅ 수수료+슬리피지 고려
   }
 
   // === 역추세 감지 ===
@@ -166,6 +174,17 @@ class Config {
   }
   get RSI_OVERBOUGHT() {
     return this.getNumber("RSI_OVERBOUGHT", 70);
+  }
+
+  // === ✅ 호가창 분석 설정 ===
+  get MAX_SPREAD_TICKS() {
+    return this.getNumber("MAX_SPREAD_TICKS", 2); // 최대 2틱 스프레드
+  }
+  get MIN_IMBALANCE() {
+    return this.getNumber("MIN_IMBALANCE", 0.2); // 최소 20% 불균형
+  }
+  get ORDERBOOK_DEPTH() {
+    return this.getNumber("ORDERBOOK_DEPTH", 10); // 10호가까지 분석
   }
 
   // === API 재시도 ===

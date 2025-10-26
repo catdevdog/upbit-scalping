@@ -3,6 +3,7 @@ import config from "../config/env.js";
 import { executeWithRetry } from "../utils/retry.js";
 import { log, formatKRW, formatPercent, sleep } from "../utils/helpers.js";
 import dashboard from "../logger/dashboardLogger.js";
+import cacheManager from "../utils/cache.js";
 
 class TradeExecutor {
   constructor() {
@@ -100,6 +101,9 @@ class TradeExecutor {
 
           await sleep(3000);
           const currency = market.split("-")[1];
+
+          // ✅ 캐시 무효화 후 조회
+          cacheManager.invalidate(`position_${market}`);
           const position = await upbitAPI.getCoinBalance(currency);
 
           if (position.balance === 0) {
@@ -157,7 +161,7 @@ class TradeExecutor {
   }
 
   /**
-   * ✅ 긴급 수정: 매도 실행 (에러 처리 강화)
+   * ✅ 개선된 매도 실행 (에러 처리 강화)
    */
   async executeSell(
     market,
@@ -182,8 +186,8 @@ class TradeExecutor {
 
     const timeSinceLastSell = Date.now() - this.lastSellTime;
     if (reason === "STOP_LOSS" || reason === "TAKE_PROFIT") {
-      log("warn", `🚨 ${displayReasonText} - 즉시 실행 (간격 무시)`);
-    } else if (timeSinceLastSell < 3000) {
+      log("warn", `🚨 중요 매도 신호 (${displayReasonText})`);
+    } else if (timeSinceLastSell < 5000) {
       log("warn", `⚠️ 매도 간격 부족: ${timeSinceLastSell}ms`);
       return null;
     }
@@ -196,51 +200,39 @@ class TradeExecutor {
     let attempt = 0;
 
     try {
+      const currency = market.split("-")[1];
+
+      // ✅ 캐시 무효화 후 현재 포지션 확인
+      cacheManager.invalidate(`position_${market}`);
+      const beforePosition = await upbitAPI.getCoinBalance(currency);
+
+      if (beforePosition.balance === 0) {
+        log("warn", "⚠️ 매도할 수량 없음 (이미 매도됨)");
+        return { alreadySold: true };
+      }
+
+      if (beforePosition.balance < volume * 0.99) {
+        log(
+          "warn",
+          `⚠️ 실제 수량 ${beforePosition.balance.toFixed(
+            8
+          )} < 요청 ${volume.toFixed(8)}`
+        );
+        volume = beforePosition.balance;
+      }
+
+      const adjustedVolume = this.adjustVolumeToTickSize(volume);
+
       while (attempt < maxRetries) {
         attempt++;
 
         try {
-          const adjustedVolume = this.adjustVolumeToTickSize(volume);
-
-          dashboard.addSellAttempt(
-            reason,
-            displayReasonText,
-            null,
-            "",
-            profitRate
-          );
-
-          log(
-            "info",
-            `💸 매도 시도 ${attempt}/${maxRetries}: ${adjustedVolume} ${market}`
-          );
-
-          // ✅ 실제 보유량 확인
-          const currency = market.split("-")[1];
-          const currentPosition = await upbitAPI.getCoinBalance(currency);
-
-          if (currentPosition.balance === 0) {
-            log("warn", "⚠️ 매도할 수량이 없음 - 이미 매도된 상태");
-            dashboard.addSellAttempt(
-              reason,
-              displayReasonText,
-              true,
-              "이미 매도됨",
-              profitRate
-            );
-            return {
-              success: true,
-              alreadySold: true,
-            };
-          }
-
-          const sellVolume = Math.min(adjustedVolume, currentPosition.balance);
-
-          log("info", `   보유: ${currentPosition.balance.toFixed(8)}`);
-          log("info", `   매도: ${sellVolume.toFixed(8)}`);
+          log("warn", `💸 매도 시도 ${attempt}/${maxRetries}`);
+          log("info", `   수량: ${adjustedVolume.toFixed(8)} ${currency}`);
+          log("info", `   사유: ${displayReasonText}`);
 
           const order = await executeWithRetry(async () => {
-            return await upbitAPI.marketSell(market, sellVolume);
+            return await upbitAPI.marketSell(market, adjustedVolume);
           }, "매도 주문");
 
           dashboard.logEvent("INFO", `매도 주문 전송: ${order.uuid}`);
@@ -251,99 +243,58 @@ class TradeExecutor {
             throw new Error("주문 체결 실패");
           }
 
+          log("success", "✅ 매도 주문 체결 완료");
+
           await sleep(3000);
+
+          // ✅ 캐시 무효화 후 포지션 확인
+          cacheManager.invalidate(`position_${market}`);
           const afterPosition = await upbitAPI.getCoinBalance(currency);
 
           if (afterPosition.balance > 0) {
-            const remaining = afterPosition.balance;
-            log(
-              "warn",
-              `⚠️ 매도 후 잔여 수량: ${remaining.toFixed(8)} ${currency}`
-            );
+            const valueKRW = afterPosition.balance * filledOrder.trade_price;
 
-            if (remaining >= 0.00001) {
-              log("info", "추가 매도 시도...");
-              await sleep(2000);
-              try {
-                const cleanupOrder = await upbitAPI.marketSell(
-                  market,
-                  remaining
+            if (valueKRW >= config.DUST_THRESHOLD_KRW) {
+              log(
+                "warn",
+                `⚠️ 매도 후 잔여 수량 존재: ${afterPosition.balance.toFixed(
+                  8
+                )} (${formatKRW(valueKRW)})`
+              );
+
+              if (attempt < maxRetries) {
+                log("warn", "재시도 중...");
+                volume = afterPosition.balance;
+                await sleep(2000);
+                continue;
+              } else {
+                log(
+                  "error",
+                  "❌ 매도 후에도 잔여 수량 남음 (최대 재시도 초과)"
                 );
-                await this.waitForOrderFill(cleanupOrder.uuid, 10000);
-                log("success", "잔여 수량 정리 완료");
-              } catch (cleanupError) {
-                log("warn", `잔여 수량 정리 실패: ${cleanupError.message}`);
               }
+            } else {
+              log("info", `✅ 매도 완료 (Dust ${formatKRW(valueKRW)} 무시)`);
             }
           }
 
-          dashboard.addSellAttempt(
-            reason,
-            displayReasonText,
-            true,
-            "",
-            profitRate
-          );
-
-          log("success", `✅ 매도 체결 확인: UUID ${order.uuid}`);
-          dashboard.logEvent(
-            "SUCCESS",
-            `매도 완료 (${displayReasonText}, 수익률: ${formatPercent(
-              profitRate
-            )})`
-          );
+          dashboard.logEvent("SUCCESS", `매도 완료 (${displayReasonText})`);
 
           return {
             success: true,
             uuid: order.uuid,
-            executedVolume: sellVolume,
             order: filledOrder,
+            alreadySold: false,
           };
         } catch (error) {
           log(
             "error",
             `매도 실패 (${attempt}/${maxRetries}): ${error.message}`
           );
-
-          // ✅ 400 에러 시 실제 포지션 확인
-          if (error.message.includes("400") || error.response?.status === 400) {
-            log("warn", "⚠️ 400 에러 발생 - 실제 포지션 확인 중...");
-            await sleep(2000);
-
-            const currency = market.split("-")[1];
-            const checkPosition = await upbitAPI.getCoinBalance(currency);
-
-            if (checkPosition.balance === 0) {
-              log("success", "✅ 이미 매도 완료된 상태 확인");
-              dashboard.addSellAttempt(
-                reason,
-                displayReasonText,
-                true,
-                "400 에러 후 확인됨",
-                profitRate
-              );
-              return {
-                success: true,
-                alreadySold: true,
-              };
-            } else {
-              log(
-                "warn",
-                `⚠️ 아직 보유 중: ${checkPosition.balance.toFixed(8)}`
-              );
-            }
-          }
-
-          dashboard.addSellAttempt(
-            reason,
-            displayReasonText,
-            false,
-            error.message,
-            profitRate
-          );
+          dashboard.logEvent("ERROR", `매도 실패: ${error.message}`);
 
           if (attempt >= maxRetries) {
-            dashboard.logEvent("ERROR", `매도 최종 실패: ${error.message}`);
+            log("error", "❌ 매도 최종 실패");
             return null;
           }
 
@@ -351,30 +302,23 @@ class TradeExecutor {
         }
       }
     } finally {
-      log("debug", "🔓 isSelling 플래그 해제");
+      const elapsed = Date.now() - this.sellStartTime;
+      log("info", `🔓 isSelling 플래그 해제 (${elapsed}ms 소요)`);
       this.isSelling = false;
     }
 
     return null;
   }
 
-  /**
-   * ✅ 개선된 주문 체결 대기
-   */
   async waitForOrderFill(uuid, timeout = 15000) {
     const startTime = Date.now();
-    let lastState = null;
     let checkCount = 0;
 
     while (Date.now() - startTime < timeout) {
-      try {
-        checkCount++;
-        const order = await upbitAPI.getOrder(uuid);
+      checkCount++;
 
-        if (order.state !== lastState) {
-          log("debug", `[${checkCount}] 주문 상태: ${order.state}`);
-          lastState = order.state;
-        }
+      try {
+        const order = await upbitAPI.getOrder(uuid);
 
         if (order.state === "done") {
           log("success", `✅ 주문 체결 완료 (${checkCount}회 확인)`);
@@ -382,17 +326,8 @@ class TradeExecutor {
         }
 
         if (order.state === "cancel") {
-          throw new Error("주문이 취소되었습니다");
-        }
-
-        if (order.state === "wait") {
-          await sleep(1000);
-          continue;
-        }
-
-        if (order.state === "watch") {
-          await sleep(500);
-          continue;
+          log("error", "❌ 주문 취소됨");
+          return null;
         }
 
         await sleep(500);
@@ -431,12 +366,22 @@ class TradeExecutor {
     return balance;
   }
 
+  /**
+   * ✅ 코인 포지션 조회 (캐싱 적용)
+   */
   async getCoinPosition(market) {
     const currency = market.split("-")[1];
 
-    const position = await executeWithRetry(async () => {
-      return await upbitAPI.getCoinBalance(currency);
-    }, `${currency} 포지션 조회`);
+    // ✅ 2초 캐시 적용
+    const position = await cacheManager.get(
+      `position_${market}`,
+      async () => {
+        return await executeWithRetry(async () => {
+          return await upbitAPI.getCoinBalance(currency);
+        }, `${currency} 포지션 조회`);
+      },
+      2000 // 2초 캐시
+    );
 
     return position;
   }
@@ -456,10 +401,19 @@ class TradeExecutor {
     return buyAmount;
   }
 
+  /**
+   * ✅ 현재가 조회 (캐싱 적용 - 0.5초)
+   */
   async getCurrentPrice(market) {
-    const ticker = await executeWithRetry(async () => {
-      return await upbitAPI.getTicker(market);
-    }, "현재가 조회");
+    const ticker = await cacheManager.get(
+      `ticker_${market}`,
+      async () => {
+        return await executeWithRetry(async () => {
+          return await upbitAPI.getTicker(market);
+        }, "현재가 조회");
+      },
+      500 // 0.5초 캐시
+    );
 
     return ticker.trade_price;
   }

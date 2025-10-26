@@ -1,48 +1,42 @@
-import { calculateAverage, calculateStdDev, toNumber } from "./helpers.js";
+/**
+ * ✅ 기술적 지표 계산 라이브러리 (VWAP, ATR 추가)
+ */
 
-export function calculateMA(candles, period) {
-  if (!candles || candles.length < period) return null;
-
-  const prices = candles
-    .slice(0, period)
-    .map((c) => toNumber(c.trade_price, 0));
-  return calculateAverage(prices);
-}
-
-export function calculateEMA(candles, period) {
-  if (!candles || candles.length < period) return null;
-
-  const k = 2 / (period + 1);
-  let ema = calculateMA(candles.slice(-period), period);
-
-  for (let i = candles.length - period - 1; i >= 0; i--) {
-    const price = toNumber(candles[i].trade_price, 0);
-    ema = price * k + ema * (1 - k);
+/**
+ * RSI (Relative Strength Index) 계산
+ */
+export function calculateRSI(candles, period = 14) {
+  if (candles.length < period + 1) {
+    return 50; // 기본값
   }
 
-  return ema;
-}
-
-export function calculateRSI(candles, period = 14) {
-  if (!candles || candles.length < period + 1) return null;
+  const changes = [];
+  for (let i = 0; i < candles.length - 1; i++) {
+    changes.push(candles[i].trade_price - candles[i + 1].trade_price);
+  }
 
   let gains = 0;
   let losses = 0;
 
   for (let i = 0; i < period; i++) {
-    const currentPrice = toNumber(candles[i].trade_price, 0);
-    const prevPrice = toNumber(candles[i + 1].trade_price, 0);
-    const change = currentPrice - prevPrice;
-
-    if (change > 0) {
-      gains += change;
+    if (changes[i] > 0) {
+      gains += changes[i];
     } else {
-      losses += Math.abs(change);
+      losses += Math.abs(changes[i]);
     }
   }
 
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+
+  for (let i = period; i < changes.length; i++) {
+    const change = changes[i];
+    const gain = change > 0 ? change : 0;
+    const loss = change < 0 ? Math.abs(change) : 0;
+
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+  }
 
   if (avgLoss === 0) return 100;
 
@@ -52,74 +46,174 @@ export function calculateRSI(candles, period = 14) {
   return rsi;
 }
 
-export function calculateBollingerBands(
-  candles,
-  period = 20,
-  stdDevMultiplier = 2
-) {
-  if (!candles || candles.length < period) return null;
-
-  const prices = candles
-    .slice(0, period)
-    .map((c) => toNumber(c.trade_price, 0));
-  const ma = calculateAverage(prices);
-  const stdDev = calculateStdDev(prices, ma);
-
-  return {
-    upper: ma + stdDev * stdDevMultiplier,
-    middle: ma,
-    lower: ma - stdDev * stdDevMultiplier,
-    stdDev,
-  };
-}
-
-export function calculateMACD(
-  candles,
-  fastPeriod = 12,
-  slowPeriod = 26,
-  signalPeriod = 9
-) {
-  if (!candles || candles.length < slowPeriod) return null;
-
-  const fastEMA = calculateEMA(candles, fastPeriod);
-  const slowEMA = calculateEMA(candles, slowPeriod);
-
-  if (!fastEMA || !slowEMA) return null;
-
-  const macd = fastEMA - slowEMA;
-
-  return {
-    macd,
-    fastEMA,
-    slowEMA,
-  };
-}
-
-export function calculateVolatility(candles, period = 20) {
-  if (!candles || candles.length < period) return null;
-
-  const returns = [];
-  for (let i = 0; i < period - 1; i++) {
-    const currentPrice = toNumber(candles[i].trade_price, 0);
-    const prevPrice = toNumber(candles[i + 1].trade_price, 0);
-
-    if (prevPrice > 0) {
-      const ret = (currentPrice - prevPrice) / prevPrice;
-      returns.push(ret);
-    }
+/**
+ * 볼린저 밴드 계산
+ */
+export function calculateBollingerBands(candles, period = 20, stdDev = 2) {
+  if (candles.length < period) {
+    return null;
   }
 
-  if (returns.length === 0) return 0;
+  const prices = candles.slice(0, period).map((c) => c.trade_price);
+  const sma = prices.reduce((sum, price) => sum + price, 0) / period;
 
-  return calculateStdDev(returns) * Math.sqrt(period);
+  const squaredDiffs = prices.map((price) => Math.pow(price - sma, 2));
+  const variance = squaredDiffs.reduce((sum, diff) => sum + diff, 0) / period;
+  const standardDeviation = Math.sqrt(variance);
+
+  return {
+    upper: sma + standardDeviation * stdDev,
+    middle: sma,
+    lower: sma - standardDeviation * stdDev,
+  };
 }
 
-export function findSupportResistance(candles, lookback = 30) {
-  if (!candles || candles.length < lookback) return null;
+/**
+ * 이동평균 계산
+ */
+export function calculateMA(candles, period) {
+  if (candles.length < period) return null;
 
-  const recentCandles = candles.slice(0, lookback);
-  const highs = recentCandles.map((c) => toNumber(c.high_price, 0));
-  const lows = recentCandles.map((c) => toNumber(c.low_price, 0));
+  const prices = candles.slice(0, period).map((c) => c.trade_price);
+  return prices.reduce((sum, price) => sum + price, 0) / period;
+}
+
+/**
+ * 변동성 계산 (표준편차 기반)
+ */
+export function calculateVolatility(candles, period = 20) {
+  if (candles.length < period) {
+    return 0;
+  }
+
+  const prices = candles.slice(0, period).map((c) => c.trade_price);
+  const mean = prices.reduce((sum, price) => sum + price, 0) / period;
+
+  const squaredDiffs = prices.map((price) => Math.pow(price - mean, 2));
+  const variance = squaredDiffs.reduce((sum, diff) => sum + diff, 0) / period;
+  const stdDev = Math.sqrt(variance);
+
+  // 변동성을 평균 가격 대비 퍼센트로 변환
+  const volatilityPercent = (stdDev / mean) * 100;
+
+  return volatilityPercent;
+}
+
+/**
+ * ✅ VWAP (Volume Weighted Average Price) 계산
+ * 거래량 가중 평균가 - 돌파/되돌림 판단에 사용
+ */
+export function calculateVWAP(candles) {
+  if (candles.length === 0) return null;
+
+  let totalVolume = 0;
+  let totalVolumePrice = 0;
+
+  for (const candle of candles) {
+    const typicalPrice =
+      (candle.high_price + candle.low_price + candle.trade_price) / 3;
+    const volume = candle.candle_acc_trade_volume;
+
+    totalVolumePrice += typicalPrice * volume;
+    totalVolume += volume;
+  }
+
+  if (totalVolume === 0) return null;
+
+  return totalVolumePrice / totalVolume;
+}
+
+/**
+ * ✅ ATR (Average True Range) 계산
+ * 변동성 측정 - 진입 필터로 사용
+ * @param {Array} candles - 캔들 데이터
+ * @param {number} period - 기간 (기본 14)
+ * @returns {number} ATR 값 (퍼센트)
+ */
+export function calculateATR(candles, period = 14) {
+  if (candles.length < period + 1) {
+    return 0;
+  }
+
+  const trueRanges = [];
+
+  for (let i = 0; i < candles.length - 1; i++) {
+    const current = candles[i];
+    const previous = candles[i + 1];
+
+    const high = current.high_price;
+    const low = current.low_price;
+    const prevClose = previous.trade_price;
+
+    // True Range = max(high-low, |high-prevClose|, |low-prevClose|)
+    const tr = Math.max(
+      high - low,
+      Math.abs(high - prevClose),
+      Math.abs(low - prevClose)
+    );
+
+    trueRanges.push(tr);
+  }
+
+  // ATR = 지수 이동평균
+  let atr =
+    trueRanges.slice(0, period).reduce((sum, tr) => sum + tr, 0) / period;
+
+  for (let i = period; i < trueRanges.length; i++) {
+    atr = (atr * (period - 1) + trueRanges[i]) / period;
+  }
+
+  // 현재가 대비 퍼센트로 변환
+  const currentPrice = candles[0].trade_price;
+  const atrPercent = (atr / currentPrice) * 100;
+
+  return atrPercent;
+}
+
+/**
+ * ✅ 단기 ATR 계산 (1~3분, 스캘핑용)
+ */
+export function calculateShortATR(candles) {
+  return calculateATR(candles, Math.min(3, candles.length - 1));
+}
+
+/**
+ * EMA (지수 이동평균) 계산
+ */
+export function calculateEMA(candles, period) {
+  if (candles.length < period) return null;
+
+  const prices = candles.map((c) => c.trade_price);
+  const multiplier = 2 / (period + 1);
+
+  // 첫 EMA는 SMA
+  let ema = prices.slice(0, period).reduce((sum, p) => sum + p, 0) / period;
+
+  // 이후 EMA 계산
+  for (let i = period; i < prices.length; i++) {
+    ema = (prices[i] - ema) * multiplier + ema;
+  }
+
+  return ema;
+}
+
+/**
+ * ✅ VWAP 이격도 계산 (퍼센트)
+ */
+export function calculateVWAPDeviation(currentPrice, vwap) {
+  if (!vwap || vwap === 0) return 0;
+  return ((currentPrice - vwap) / vwap) * 100;
+}
+
+/**
+ * ✅ 지지/저항 레벨 계산
+ */
+export function calculateSupportResistance(candles, period = 20) {
+  if (candles.length < period) return null;
+
+  const recentCandles = candles.slice(0, period);
+  const highs = recentCandles.map((c) => c.high_price);
+  const lows = recentCandles.map((c) => c.low_price);
 
   return {
     resistance: Math.max(...highs),
@@ -127,35 +221,20 @@ export function findSupportResistance(candles, lookback = 30) {
   };
 }
 
-export function detectCandlePattern(candles, count = 3) {
-  if (!candles || candles.length < count) return null;
-
-  const recent = candles.slice(0, count);
-
-  let bullishCount = 0;
-  let bearishCount = 0;
-  const changes = [];
-
-  for (const candle of recent) {
-    const tradePrice = toNumber(candle.trade_price, 0);
-    const openingPrice = toNumber(candle.opening_price, 0);
-
-    if (openingPrice > 0) {
-      const change = ((tradePrice - openingPrice) / openingPrice) * 100;
-      changes.push(change);
-
-      if (tradePrice > openingPrice) {
-        bullishCount++;
-      } else if (tradePrice < openingPrice) {
-        bearishCount++;
-      }
-    }
+/**
+ * ✅ 상대거래량 (RVOL) 계산
+ * RVOL = 현재 거래량 / N일 평균 거래량
+ */
+export function calculateRVOL(currentVolume, historicalCandles) {
+  if (!historicalCandles || historicalCandles.length === 0) {
+    return 1.0;
   }
 
-  return {
-    consecutiveBullish: bullishCount === count,
-    consecutiveBearish: bearishCount === count,
-    changes,
-    avgChange: calculateAverage(changes),
-  };
+  const avgVolume =
+    historicalCandles.reduce((sum, c) => sum + c.candle_acc_trade_volume, 0) /
+    historicalCandles.length;
+
+  if (avgVolume === 0) return 1.0;
+
+  return currentVolume / avgVolume;
 }
