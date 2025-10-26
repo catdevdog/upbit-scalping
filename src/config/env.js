@@ -64,6 +64,17 @@ class Config {
     return this.getBoolean("AUTO_IGNORE_DUST", true);
   }
 
+  // === ✅ 수수료 상수 (업비트 기준) ===
+  get UPBIT_MAKER_FEE() {
+    return 0.05; // 0.05%
+  }
+  get UPBIT_TAKER_FEE() {
+    return 0.05; // 0.05%
+  }
+  get UPBIT_TOTAL_FEE() {
+    return this.UPBIT_MAKER_FEE + this.UPBIT_TAKER_FEE; // 0.1%
+  }
+
   // === 전략 활성화 (스캘핑 전용) ===
   get STRATEGY_RSI() {
     return this.getBoolean("STRATEGY_RSI", true);
@@ -105,7 +116,7 @@ class Config {
     return this.getNumber("VOLATILITY_THRESHOLD", 2.0);
   }
 
-  // === 손절/익절 (✅ 수정) ===
+  // === 손절/익절 ===
   get STOP_LOSS_PERCENT() {
     return this.getNumber("STOP_LOSS_PERCENT", -0.8);
   }
@@ -122,18 +133,18 @@ class Config {
     return this.getNumber("TRAILING_STOP_PERCENT", 0.25);
   }
 
-  // === 시간 기반 청산 (✅ 수정) ===
+  // === 시간 기반 청산 ===
   get MAX_HOLDING_TIME() {
     return this.getNumber("MAX_HOLDING_TIME", 180);
   }
   get PROFIT_TIME_LIMIT() {
-    return this.getNumber("PROFIT_TIME_LIMIT", 90);
+    return this.getNumber("PROFIT_TIME_LIMIT", 120); // ✅ 90초 → 120초로 증가
   }
   get SIDEWAYS_TIME_LIMIT() {
     return this.getNumber("SIDEWAYS_TIME_LIMIT", 60);
   }
 
-  // === 모멘텀 기반 청산 (✅ 수정) ===
+  // === ✅ 모멘텀 기반 청산 (수수료 고려 상향) ===
   get MOMENTUM_CHECK_PERIOD() {
     return this.getNumber("MOMENTUM_CHECK_PERIOD", 20);
   }
@@ -141,7 +152,12 @@ class Config {
     return this.getNumber("MOMENTUM_THRESHOLD", 0.08);
   }
   get SIDEWAYS_EXIT_THRESHOLD() {
-    return this.getNumber("SIDEWAYS_EXIT_THRESHOLD", 0.25);
+    // ✅ 0.25% → 0.5%로 상향 (수수료 0.1% 고려)
+    return this.getNumber("SIDEWAYS_EXIT_THRESHOLD", 0.5);
+  }
+  get MIN_PROFIT_FOR_TIME_EXIT() {
+    // ✅ 시간 기반 청산 최소 수익률 (수수료 + 최소 이익)
+    return this.getNumber("MIN_PROFIT_FOR_TIME_EXIT", 0.4);
   }
 
   // === 역추세 감지 ===

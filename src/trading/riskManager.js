@@ -5,7 +5,7 @@ import { calculateEntryScore } from "../strategies/index.js";
 import { calculateRSI } from "../utils/indicators.js";
 import upbitAPI from "../api/upbit.js";
 import cacheManager from "../utils/cache.js";
-import positionManager from "./position.js"; // Position manager import
+import positionManager from "./position.js";
 
 class RiskManager {
   constructor() {
@@ -22,6 +22,13 @@ class RiskManager {
   }
 
   /**
+   * ✅ 실제 수익률 계산 (수수료 차감 후)
+   */
+  calculateNetProfit(profitRate) {
+    return profitRate - config.UPBIT_TOTAL_FEE;
+  }
+
+  /**
    * 종합 청산 조건 체크 (스캘핑 로직)
    */
   async checkExitConditions(positionData, currentPrice) {
@@ -33,6 +40,9 @@ class RiskManager {
     const holdingSeconds = Math.floor(
       (Date.now() - positionData.buyTime) / 1000
     );
+
+    // ✅ 실제 수익률 계산
+    const netProfit = this.calculateNetProfit(profitRate);
 
     // === 1. 손절 체크 (최우선) ===
     const stopLossCheck = this.checkStopLoss(profitRate);
@@ -47,21 +57,34 @@ class RiskManager {
     if (trailingCheck.shouldExit) return trailingCheck;
 
     // === 4. 시간 기반 청산 (스캘핑 핵심) ===
-    const timeCheck = this.checkTimeBasedExit(holdingSeconds, profitRate);
+    const timeCheck = this.checkTimeBasedExit(
+      holdingSeconds,
+      profitRate,
+      netProfit
+    );
     if (timeCheck.shouldExit) return timeCheck;
 
     // === 5. 모멘텀 소멸 청산 ===
-    const momentumCheck = this.checkMomentumExit(holdingSeconds);
+    const momentumCheck = this.checkMomentumExit(
+      holdingSeconds,
+      profitRate,
+      netProfit
+    );
     if (momentumCheck.shouldExit) return momentumCheck;
 
     // === 6. 횡보 청산 ===
-    const sidewaysCheck = this.checkSidewaysExit(holdingSeconds, profitRate);
+    const sidewaysCheck = this.checkSidewaysExit(
+      holdingSeconds,
+      profitRate,
+      netProfit
+    );
     if (sidewaysCheck.shouldExit) return sidewaysCheck;
 
     // === 7. 역추세 감지 청산 ===
     if (config.REVERSE_SIGNAL_CHECK) {
       const reverseCheck = await this.checkReverseSignal(
         profitRate,
+        netProfit,
         holdingSeconds
       );
       if (reverseCheck.shouldExit) return reverseCheck;
@@ -208,19 +231,25 @@ class RiskManager {
   }
 
   /**
-   * 시간 기반 청산 (스캘핑 핵심)
+   * ✅ 시간 기반 청산 (수수료 고려)
    */
-  checkTimeBasedExit(holdingSeconds, profitRate) {
-    // Case 1: 최대 보유 시간 초과 (최소 수익률 체크 추가)
+  checkTimeBasedExit(holdingSeconds, profitRate, netProfit) {
+    // Case 1: 최대 보유 시간 초과
     if (holdingSeconds >= config.MAX_HOLDING_TIME) {
-      // 최소 수익률 이상일 때만 청산
-      if (profitRate >= config.SIDEWAYS_EXIT_THRESHOLD) {
+      // ✅ 실제 수익이 있을 때만 청산 (수수료 차감 후)
+      if (netProfit >= 0.2) {
         if (!this.conditionTracking.timeLimit) {
           this.conditionTracking.timeLimit = true;
           dashboard.addConditionReached("TIME_LIMIT", profitRate, 0, 0);
           log(
             "info",
-            `⏰ 최대 보유시간(${config.MAX_HOLDING_TIME}초) 초과 + 수익 확보 → 청산`
+            `⏰ 최대 보유시간(${config.MAX_HOLDING_TIME}초) 초과 + 순수익 확보 → 청산`
+          );
+          log(
+            "info",
+            `   표시수익: ${formatPercent(
+              profitRate
+            )} / 실제수익: ${formatPercent(netProfit)}`
           );
         }
 
@@ -231,30 +260,35 @@ class RiskManager {
           profitRate,
         };
       } else {
-        // 수익률 부족 시 청산하지 않음 (손절선 대기)
+        // 실제 수익 부족 시 청산하지 않음
         if (!this.conditionTracking.timeLimit) {
           this.conditionTracking.timeLimit = true;
           log(
             "warn",
-            `⏰ 시간 초과지만 수익률 부족 (${formatPercent(
+            `⏰ 시간 초과지만 순수익 부족 (표시: ${formatPercent(
               profitRate
-            )} < ${formatPercent(
-              config.SIDEWAYS_EXIT_THRESHOLD
-            )}) - 손절선 대기`
+            )}, 실제: ${formatPercent(netProfit)}) - 손절선 대기`
           );
         }
         return { shouldExit: false };
       }
     }
 
-    // Case 2: PROFIT_TIME_LIMIT 초과 + 소폭 수익 → 청산
+    // Case 2: PROFIT_TIME_LIMIT 초과 + 소폭 수익
     if (holdingSeconds >= config.PROFIT_TIME_LIMIT) {
-      if (profitRate >= config.SIDEWAYS_EXIT_THRESHOLD) {
+      // ✅ MIN_PROFIT_FOR_TIME_EXIT 이상일 때만 청산
+      if (profitRate >= config.MIN_PROFIT_FOR_TIME_EXIT) {
         if (!this.conditionTracking.timeLimit) {
           this.conditionTracking.timeLimit = true;
           log(
             "info",
-            `🕐 ${config.PROFIT_TIME_LIMIT}초 경과 + 수익 확보 → 청산`
+            `🕐 ${config.PROFIT_TIME_LIMIT}초 경과 + 최소 수익 확보 → 청산`
+          );
+          log(
+            "info",
+            `   표시수익: ${formatPercent(
+              profitRate
+            )} / 실제수익: ${formatPercent(netProfit)}`
           );
         }
 
@@ -264,6 +298,15 @@ class RiskManager {
           reasonText: `🕐 시간익절(${holdingSeconds}초)`,
           profitRate,
         };
+      } else {
+        log(
+          "debug",
+          `🕐 ${
+            config.PROFIT_TIME_LIMIT
+          }초 경과지만 수익률 부족: ${formatPercent(
+            profitRate
+          )} < ${formatPercent(config.MIN_PROFIT_FOR_TIME_EXIT)}`
+        );
       }
     }
 
@@ -279,15 +322,13 @@ class RiskManager {
   }
 
   /**
-   * 모멘텀 소멸 청산 (position 모듈 직접 호출)
+   * ✅ 모멘텀 소멸 청산 (수수료 고려)
    */
-  checkMomentumExit(holdingSeconds) {
-    // 60초 이상 보유 시에만 체크
+  checkMomentumExit(holdingSeconds, profitRate, netProfit) {
     if (holdingSeconds < config.SIDEWAYS_TIME_LIMIT) {
       return { shouldExit: false };
     }
 
-    // positionManager 모듈의 메서드 직접 호출
     const momentumLoss = positionManager.checkMomentumLoss();
 
     if (momentumLoss) {
@@ -299,23 +340,15 @@ class RiskManager {
         );
       }
 
-      // positionManager에서 현재가 조회
-      const priceHistory = positionManager.priceHistory;
-      if (priceHistory.length === 0) {
-        return { shouldExit: false };
-      }
+      // ✅ 실제 수익이 있을 때만 청산
+      if (netProfit >= 0.2) {
+        log(
+          "info",
+          `📊 모멘텀 소멸 + 순수익 확보 → 청산 (표시: ${formatPercent(
+            profitRate
+          )}, 실제: ${formatPercent(netProfit)})`
+        );
 
-      const currentPrice = priceHistory[priceHistory.length - 1]?.price;
-      const avgBuyPrice = positionManager.position?.avgBuyPrice;
-
-      if (!currentPrice || !avgBuyPrice) {
-        return { shouldExit: false };
-      }
-
-      const profitRate = ((currentPrice - avgBuyPrice) / avgBuyPrice) * 100;
-
-      // 최소 수익률 이상일 때만 청산
-      if (profitRate >= config.SIDEWAYS_EXIT_THRESHOLD) {
         return {
           shouldExit: true,
           reason: "MOMENTUM_LOSS",
@@ -325,9 +358,9 @@ class RiskManager {
       } else {
         log(
           "debug",
-          `📊 모멘텀 소멸이지만 수익률 부족: ${formatPercent(
+          `📊 모멘텀 소멸이지만 순수익 부족: 표시 ${formatPercent(
             profitRate
-          )} < ${formatPercent(config.SIDEWAYS_EXIT_THRESHOLD)}`
+          )}, 실제 ${formatPercent(netProfit)}`
         );
       }
     } else {
@@ -340,15 +373,13 @@ class RiskManager {
   }
 
   /**
-   * 횡보 청산 (position 모듈 직접 호출)
+   * ✅ 횡보 청산 (수수료 고려)
    */
-  checkSidewaysExit(holdingSeconds, profitRate) {
-    // 60초 이상 보유 시에만 체크
+  checkSidewaysExit(holdingSeconds, profitRate, netProfit) {
     if (holdingSeconds < config.SIDEWAYS_TIME_LIMIT) {
       return { shouldExit: false };
     }
 
-    // positionManager 모듈의 메서드 직접 호출
     const isSideways = positionManager.isSideways(config.SIDEWAYS_TIME_LIMIT);
 
     if (isSideways) {
@@ -360,8 +391,15 @@ class RiskManager {
         );
       }
 
-      // 최소 수익률 이상일 때만 청산
+      // ✅ 최소 수익률 이상일 때만 청산
       if (profitRate >= config.SIDEWAYS_EXIT_THRESHOLD) {
+        log(
+          "info",
+          `➡️ 횡보 + 목표 수익 달성 → 청산 (표시: ${formatPercent(
+            profitRate
+          )}, 실제: ${formatPercent(netProfit)})`
+        );
+
         return {
           shouldExit: true,
           reason: "SIDEWAYS",
@@ -386,10 +424,9 @@ class RiskManager {
   }
 
   /**
-   * 역추세 감지 청산
+   * ✅ 역추세 감지 청산 (수수료 고려)
    */
-  async checkReverseSignal(profitRate, holdingSeconds) {
-    // 최소 보유 시간 체크 (60초 미만에서는 역추세 청산 안 함)
+  async checkReverseSignal(profitRate, netProfit, holdingSeconds) {
     if (holdingSeconds < config.SIDEWAYS_TIME_LIMIT) {
       return { shouldExit: false };
     }
@@ -405,8 +442,15 @@ class RiskManager {
           log("warn", `🔄 진입 신호 모두 소멸 → 청산 고려`);
         }
 
-        // 손실이 아니면 청산
-        if (profitRate >= config.SIDEWAYS_EXIT_THRESHOLD) {
+        // ✅ 실제 수익이 있을 때만 청산
+        if (netProfit >= 0.2) {
+          log(
+            "info",
+            `🔄 신호 소멸 + 순수익 확보 → 청산 (표시: ${formatPercent(
+              profitRate
+            )}, 실제: ${formatPercent(netProfit)})`
+          );
+
           return {
             shouldExit: true,
             reason: "SIGNAL_LOSS",
@@ -432,8 +476,15 @@ class RiskManager {
             log("warn", `🔄 RSI 과매수 (${rsi.toFixed(1)}) → 청산 고려`);
           }
 
-          // 손실이 아니면 청산
-          if (profitRate >= config.SIDEWAYS_EXIT_THRESHOLD) {
+          // ✅ 실제 수익이 있을 때만 청산
+          if (netProfit >= 0.2) {
+            log(
+              "info",
+              `🔄 과매수 + 순수익 확보 → 청산 (표시: ${formatPercent(
+                profitRate
+              )}, 실제: ${formatPercent(netProfit)})`
+            );
+
             return {
               shouldExit: true,
               reason: "RSI_OVERBOUGHT",
