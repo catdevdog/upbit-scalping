@@ -74,7 +74,7 @@ export function log(level, message, data = null) {
 
   const reset = "\x1b[0m";
 
-  // console.log(`${color}${icon} [${timestamp}] ${message}${reset}`);
+  console.log(`${color}${icon} [${timestamp}] ${message}${reset}`);
 
   if (data) {
     console.log(
