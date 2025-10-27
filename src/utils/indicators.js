@@ -131,50 +131,41 @@ export function calculateVWAP(candles) {
  * @returns {number} ATR 값 (퍼센트)
  */
 export function calculateATR(candles, period = 14) {
-  if (candles.length < period + 1) {
-    return 0;
+  if (!candles || candles.length < period + 1) return 0;
+
+  // 오래된 → 최신 정렬
+  const arr = [...candles].sort(
+    (a, b) =>
+      new Date(a.candle_date_time_kst).getTime() -
+      new Date(b.candle_date_time_kst).getTime()
+  );
+
+  // TR% = TR / prevClose × 100
+  const trPct = [];
+  for (let i = 1; i < arr.length; i++) {
+    const cur = arr[i];
+    const prev = arr[i - 1];
+    const H = cur.high_price;
+    const L = cur.low_price;
+    const Cprev = prev.trade_price;
+    const TR = Math.max(H - L, Math.abs(H - Cprev), Math.abs(L - Cprev));
+    trPct.push((TR / Cprev) * 100);
   }
 
-  const trueRanges = [];
+  // 초기값: 가장 오래된 구간부터 period개 평균
+  let atr = trPct.slice(0, period).reduce((s, v) => s + v, 0) / period;
 
-  for (let i = 0; i < candles.length - 1; i++) {
-    const current = candles[i];
-    const previous = candles[i + 1];
-
-    const high = current.high_price;
-    const low = current.low_price;
-    const prevClose = previous.trade_price;
-
-    // True Range = max(high-low, |high-prevClose|, |low-prevClose|)
-    const tr = Math.max(
-      high - low,
-      Math.abs(high - prevClose),
-      Math.abs(low - prevClose)
-    );
-
-    trueRanges.push(tr);
+  // Wilder 평활
+  for (let i = period; i < trPct.length; i++) {
+    atr = atr + (trPct[i] - atr) / period;
   }
 
-  // ATR = 지수 이동평균
-  let atr =
-    trueRanges.slice(0, period).reduce((sum, tr) => sum + tr, 0) / period;
-
-  for (let i = period; i < trueRanges.length; i++) {
-    atr = (atr * (period - 1) + trueRanges[i]) / period;
-  }
-
-  // 현재가 대비 퍼센트로 변환
-  const currentPrice = candles[0].trade_price;
-  const atrPercent = (atr / currentPrice) * 100;
-
-  return atrPercent;
+  return Number.isFinite(atr) ? atr : 0; // % 값
 }
 
-/**
- * ✅ 단기 ATR 계산 (1~3분, 스캘핑용)
- */
+// 스캘핑용 단기
 export function calculateShortATR(candles) {
-  return calculateATR(candles, Math.min(3, candles.length - 1));
+  return calculateATR(candles, 5);
 }
 
 /**

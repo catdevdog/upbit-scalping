@@ -1,8 +1,13 @@
 import upbitAPI from "../api/upbit.js";
-import { calculateRSI, calculateRVOL } from "../utils/indicators.js";
+import {
+  calculateRSI,
+  calculateRVOL,
+  calculateShortATR,
+} from "../utils/indicators.js";
 import { calculateAverage, log } from "../utils/helpers.js";
 import cacheManager from "../utils/cache.js";
 import config from "../config/env.js";
+import { calculateATR } from "../utils/indicators.js";
 
 /**
  * ⚡ 스캘핑 전용 RSI 전략 (1분봉, 민감)
@@ -375,53 +380,43 @@ export async function checkScalpingCandle(market) {
 }
 
 /**
- * ✅ ATR 변동성 필터 - 진입 전 체크 (선택적)
+ * ✅ ATR 변동성 필터 - 진입 전 체크 (진짜 ATR)
  */
-export async function checkATRFilter(market) {
+export async function checkATRFilter(
+  market,
+  { unit = 1, period = 14, threshold = config.MIN_ATR_THRESHOLD } = {}
+) {
   try {
     const candles = await cacheManager.get(
-      `candles_1m_${market}_atr`,
-      () => upbitAPI.getCandles(market, 20, "minutes", 1),
+      `candles_${unit}m_${market}_atr`,
+      () => upbitAPI.getCandles(market, period + 20, "minutes", unit),
       1000
     );
 
-    if (candles.length < 10) {
-      return { pass: true, reason: "데이터 부족", atr: 0 };
+    if (!candles || candles.length < period + 1) {
+      log("warn", `데이터 부족: ${candles?.length ?? 0}`);
+      return { pass: false, reason: "데이터 부족", atr: 0 };
     }
 
-    // 단순 변동성 계산 (ATR 대신)
-    const recentCandles = candles.slice(0, 5);
-    let totalRange = 0;
-
-    for (const candle of recentCandles) {
-      const range =
-        ((candle.high_price - candle.low_price) / candle.low_price) * 100;
-      totalRange += range;
+    const atr = calculateShortATR(candles); // % 반환(오름차순·TR%·Wilder 전제)
+    if (!Number.isFinite(atr)) {
+      return { pass: false, reason: "ATR 계산 실패", atr: 0 };
     }
 
-    const avgRange = totalRange / recentCandles.length;
-
-    if (avgRange < config.MIN_ATR_THRESHOLD) {
-      log(
-        "warn",
-        `⚠️ 변동성 부족 (${avgRange.toFixed(2)}% < ${
-          config.MIN_ATR_THRESHOLD
-        }%) - 진입 금지`
-      );
-      return {
-        pass: false,
-        reason: `변동성 부족 ${avgRange.toFixed(2)}%`,
-        atr: avgRange,
-      };
-    }
-
+    const pass = atr >= threshold;
+    log(
+      pass ? "info" : "warn",
+      `${pass ? "✅" : "⚠️"} ATR ${atr.toFixed(3)}% ${
+        pass ? "≥" : "<"
+      } ${threshold.toFixed(2)}%`
+    );
     return {
-      pass: true,
-      reason: `변동성 충분 ${avgRange.toFixed(2)}%`,
-      atr: avgRange,
+      pass,
+      reason: `${pass ? "변동성 충분" : "변동성 부족"} ${atr.toFixed(3)}%`,
+      atr,
     };
-  } catch (error) {
-    log("error", "[ATR Filter] 실행 실패", error.message);
-    return { pass: true, reason: "필터 실패", atr: 0 }; // 에러 시 통과
+  } catch (e) {
+    log("error", "[ATR Filter] 실행 실패", e.message);
+    return { pass: false, reason: "필터 실패", atr: 0 };
   }
 }

@@ -498,7 +498,8 @@ class DashboardLogger {
   }
 
   /**
-   * 🆕 전략 상태 개선 (각 전략별 상세 점수)
+   * 🆕 전략 상태 개선 (ATR 수치 표시 추가)
+   * src/logger/dashboardLogger.js 파일의 printStrategyStatusEnhanced 함수를 아래 내용으로 교체하세요
    */
   printStrategyStatusEnhanced() {
     const signals = this.currentData.strategySignals;
@@ -517,6 +518,16 @@ class DashboardLogger {
     const threshold = toNumber(signals.threshold, 40);
     const scoreProgress = Math.min(100, (totalScore / threshold) * 100);
 
+    // ✅ ATR 정보 추가
+    const atr = toNumber(signals.atr, 0);
+    const atrThreshold = 0.2; // MIN_ATR_THRESHOLD
+    const atrPass = atr >= atrThreshold;
+    const atrColor = atrPass ? "\x1b[32m" : "\x1b[31m";
+    const atrIcon = atrPass ? "✅" : "❌";
+
+    // ATR 실패 여부 체크
+    const atrFailed = signals.filterFailed === "ATR";
+
     // 전체 점수 바
     const scoreBar = this.createProgressBar(
       40,
@@ -529,6 +540,22 @@ class DashboardLogger {
       `  📊 총점: ${scoreColor}\x1b[1m${totalScore}/${threshold}점\x1b[0m`
     );
     console.log(`     ${scoreBar}`);
+
+    // ✅ ATR 표시 추가
+    console.log("");
+    console.log(
+      `  ${atrIcon} 변동성 (ATR): ${atrColor}\x1b[1m${atr.toFixed(
+        3
+      )}%\x1b[0m (기준: ${atrThreshold}%)`
+    );
+
+    if (atrFailed || !atrPass) {
+      const reason = signals.filterReason || "변동성 부족";
+      console.log(`     └─ ⚠️  \x1b[33m${reason} - 진입 대기 중\x1b[0m`);
+    } else {
+      console.log(`     └─ ✅ \x1b[32m진입 가능한 변동성\x1b[0m`);
+    }
+
     console.log("");
 
     // 각 전략별 상세
