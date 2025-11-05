@@ -498,8 +498,7 @@ class DashboardLogger {
   }
 
   /**
-   * 🆕 전략 상태 개선 (ATR 수치 표시 추가)
-   * src/logger/dashboardLogger.js 파일의 printStrategyStatusEnhanced 함수를 아래 내용으로 교체하세요
+   * ✅ 전략 상태 개선 - 음수 점수 처리
    */
   printStrategyStatusEnhanced() {
     const signals = this.currentData.strategySignals;
@@ -516,7 +515,12 @@ class DashboardLogger {
 
     const totalScore = toNumber(signals.totalScore, 0);
     const threshold = toNumber(signals.threshold, 40);
-    const scoreProgress = Math.min(100, (totalScore / threshold) * 100);
+
+    // ✅ scoreProgress 음수 방지
+    const scoreProgress = Math.max(
+      0,
+      Math.min(100, (totalScore / threshold) * 100)
+    );
 
     // ✅ ATR 정보 추가
     const atr = toNumber(signals.atr, 0);
@@ -567,13 +571,22 @@ class DashboardLogger {
         const isBuy = signal.signal === "BUY";
         const icon = isBuy ? "🚀" : "⏳";
         const color = isBuy ? "\x1b[32m" : "\x1b[90m";
+
+        // ✅ 음수 점수 처리
         const score = toNumber(signal.score, 0);
         const targetScore = this.getTargetScoreForStrategy(signal.name);
-        const progress = Math.min(100, (score / targetScore) * 100);
 
-        console.log(
-          `     ${icon} ${signal.name.padEnd(10)} ${color}${score}점\x1b[0m`
+        // ✅ progress 음수 방지
+        const progress = Math.max(
+          0,
+          Math.min(100, (score / targetScore) * 100)
         );
+
+        // ✅ 음수 점수 표시 개선
+        const scoreDisplay =
+          score < 0 ? `\x1b[31m${score}점\x1b[0m` : `${color}${score}점\x1b[0m`;
+
+        console.log(`     ${icon} ${signal.name.padEnd(10)} ${scoreDisplay}`);
 
         // 미니 프로그레스 바
         const miniBar = this.createMiniProgressBar(20, progress, isBuy);
@@ -655,14 +668,22 @@ class DashboardLogger {
   }
 
   /**
-   * 미니 프로그레스 바 (전략용)
+   * ✅ 미니 프로그레스 바 (전략용) - 음수 방어
    */
   createMiniProgressBar(width, progress, isComplete) {
-    const filledWidth = Math.floor((width * progress) / 100);
-    const emptyWidth = width - filledWidth;
+    // ✅ CRITICAL: progress와 width 검증 및 보정
+    const safeWidth = Math.max(1, Math.min(100, Math.floor(width || 20)));
+    const safeProgress = Math.max(0, Math.min(100, parseFloat(progress || 0)));
+
+    // ✅ filledWidth 음수 방지
+    const filledWidth = Math.max(
+      0,
+      Math.floor((safeWidth * safeProgress) / 100)
+    );
+    const emptyWidth = Math.max(0, safeWidth - filledWidth);
 
     if (isComplete) {
-      return "\x1b[32m" + "█".repeat(width) + "\x1b[0m";
+      return "\x1b[32m" + "█".repeat(safeWidth) + "\x1b[0m";
     } else {
       const filled = "\x1b[33m" + "█".repeat(filledWidth) + "\x1b[0m";
       const empty = "\x1b[90m" + "░".repeat(emptyWidth) + "\x1b[0m";
@@ -857,16 +878,27 @@ class DashboardLogger {
     console.log("");
   }
 
+  /**
+   * ✅ 프로그레스 바 생성 - 음수 방어
+   */
   createProgressBar(width, progress, isComplete) {
-    const filledWidth = Math.floor((width * progress) / 100);
-    const emptyWidth = width - filledWidth;
+    // ✅ CRITICAL: progress와 width 검증 및 보정
+    const safeWidth = Math.max(1, Math.min(100, Math.floor(width || 40)));
+    const safeProgress = Math.max(0, Math.min(100, parseFloat(progress || 0)));
+
+    // ✅ filledWidth 음수 방지
+    const filledWidth = Math.max(
+      0,
+      Math.floor((safeWidth * safeProgress) / 100)
+    );
+    const emptyWidth = Math.max(0, safeWidth - filledWidth);
 
     if (isComplete) {
-      return "\x1b[32m" + "█".repeat(width) + "\x1b[0m";
+      return "\x1b[32m" + "█".repeat(safeWidth) + "\x1b[0m";
     } else {
       const filled = "\x1b[33m" + "█".repeat(filledWidth) + "\x1b[0m";
       const empty = "\x1b[90m" + "░".repeat(emptyWidth) + "\x1b[0m";
-      return filled + empty + ` ${safeToFixed(progress, 1)}%`;
+      return filled + empty + ` ${safeToFixed(safeProgress, 1)}%`;
     }
   }
 

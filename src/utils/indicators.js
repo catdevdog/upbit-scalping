@@ -1,12 +1,12 @@
 /**
- * ✅ 기술적 지표 계산 라이브러리 (VWAP, ATR 추가)
+ * ✅ 기술적 지표 계산 라이브러리 (안전성 강화)
  */
 
 /**
  * RSI (Relative Strength Index) 계산
  */
 export function calculateRSI(candles, period = 14) {
-  if (candles.length < period + 1) {
+  if (!candles || candles.length < period + 1) {
     return 50; // 기본값
   }
 
@@ -79,24 +79,39 @@ export function calculateMA(candles, period) {
 }
 
 /**
- * 변동성 계산 (표준편차 기반)
+ * ✅ 변동성 계산 (표준편차 기반) - 안전성 강화
  */
 export function calculateVolatility(candles, period = 20) {
-  if (candles.length < period) {
+  // ✅ 데이터 검증
+  if (!candles || !Array.isArray(candles)) {
+    console.error("❌ [calculateVolatility] candles가 배열이 아님");
     return 0;
   }
 
-  const prices = candles.slice(0, period).map((c) => c.trade_price);
-  const mean = prices.reduce((sum, price) => sum + price, 0) / period;
+  // ✅ period 검증 및 보정
+  let safePeriod = Math.max(1, Math.min(candles.length, Math.floor(period)));
+
+  if (candles.length < safePeriod) {
+    safePeriod = candles.length;
+  }
+
+  // ✅ 최소 데이터 검증
+  if (safePeriod < 2) {
+    return 0;
+  }
+
+  const prices = candles.slice(0, safePeriod).map((c) => c.trade_price);
+  const mean = prices.reduce((sum, price) => sum + price, 0) / safePeriod;
 
   const squaredDiffs = prices.map((price) => Math.pow(price - mean, 2));
-  const variance = squaredDiffs.reduce((sum, diff) => sum + diff, 0) / period;
+  const variance =
+    squaredDiffs.reduce((sum, diff) => sum + diff, 0) / safePeriod;
   const stdDev = Math.sqrt(variance);
 
   // 변동성을 평균 가격 대비 퍼센트로 변환
-  const volatilityPercent = (stdDev / mean) * 100;
+  const volatilityPercent = mean > 0 ? (stdDev / mean) * 100 : 0;
 
-  return volatilityPercent;
+  return Number.isFinite(volatilityPercent) ? volatilityPercent : 0;
 }
 
 /**
