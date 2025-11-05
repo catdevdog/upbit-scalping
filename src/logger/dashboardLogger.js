@@ -520,7 +520,7 @@ class DashboardLogger {
 
     // ✅ ATR 정보 추가
     const atr = toNumber(signals.atr, 0);
-    const atrThreshold = 0.2; // MIN_ATR_THRESHOLD
+    const atrThreshold = toNumber(env.MIN_ATR_THRESHOLD, 0.08);
     const atrPass = atr >= atrThreshold;
     const atrColor = atrPass ? "\x1b[32m" : "\x1b[31m";
     const atrIcon = atrPass ? "✅" : "❌";

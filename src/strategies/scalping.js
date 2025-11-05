@@ -7,7 +7,6 @@ import {
 import { calculateAverage, log } from "../utils/helpers.js";
 import cacheManager from "../utils/cache.js";
 import config from "../config/env.js";
-import { calculateATR } from "../utils/indicators.js";
 
 /**
  * ⚡ 스캘핑 전용 RSI 전략 (1분봉, 민감)
@@ -380,25 +379,54 @@ export async function checkScalpingCandle(market) {
 }
 
 /**
- * ✅ ATR 변동성 필터 - 진입 전 체크 (진짜 ATR)
+ * ✅ ATR 변동성 필터 - 진입 전 체크 (완전 방어)
  */
-export async function checkATRFilter(
-  market,
-  { unit = 1, period = 14, threshold = config.MIN_ATR_THRESHOLD } = {}
-) {
+export async function checkATRFilter(market, options = {}) {
   try {
+    // ✅ CRITICAL: 모든 파라미터 검증 및 보정
+    const unit = Math.max(1, Math.min(60, Math.floor(options.unit || 1)));
+    const period = Math.max(3, Math.min(50, Math.floor(options.period || 14)));
+    const threshold = Math.max(
+      0,
+      Math.min(10, parseFloat(options.threshold || config.MIN_ATR_THRESHOLD))
+    );
+
+    // 파라미터 보정 로그
+    if (
+      options.unit !== unit ||
+      options.period !== period ||
+      options.threshold !== threshold
+    ) {
+      log(
+        "warn",
+        `[ATR Filter] 파라미터 보정: unit=${options.unit}→${unit}, period=${options.period}→${period}, threshold=${options.threshold}→${threshold}`
+      );
+    }
+
+    // ✅ count 계산 (최소 period+1, 안전 여유 +20)
+    const requiredCount = period + 20;
+    const safeCount = Math.max(period + 1, Math.min(200, requiredCount));
+
+    log(
+      "debug",
+      `[ATR Filter] 파라미터: unit=${unit}, period=${period}, count=${safeCount}, threshold=${threshold}`
+    );
+
     const candles = await cacheManager.get(
       `candles_${unit}m_${market}_atr`,
-      () => upbitAPI.getCandles(market, period + 20, "minutes", unit),
+      () => upbitAPI.getCandles(market, safeCount, "minutes", unit),
       1000
     );
 
     if (!candles || candles.length < period + 1) {
-      log("warn", `데이터 부족: ${candles?.length ?? 0}`);
+      log(
+        "warn",
+        `[ATR Filter] 데이터 부족: ${candles?.length ?? 0} < ${period + 1}`
+      );
       return { pass: false, reason: "데이터 부족", atr: 0 };
     }
 
-    const atr = calculateShortATR(candles); // % 반환(오름차순·TR%·Wilder 전제)
+    const atr = calculateShortATR(candles); // % 반환
     if (!Number.isFinite(atr)) {
       return { pass: false, reason: "ATR 계산 실패", atr: 0 };
     }
@@ -417,6 +445,7 @@ export async function checkATRFilter(
     };
   } catch (e) {
     log("error", "[ATR Filter] 실행 실패", e.message);
+    log("error", "[ATR Filter] 스택:", e.stack);
     return { pass: false, reason: "필터 실패", atr: 0 };
   }
 }

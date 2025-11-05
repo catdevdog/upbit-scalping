@@ -19,8 +19,58 @@ class Config {
     return process.env[key] || defaultValue;
   }
 
-  getNumber(key, defaultValue = 0) {
-    return Number(process.env[key]) || defaultValue;
+  /**
+   * ✅ 개선된 숫자 파싱 - 음수 차단 + 유효성 검증
+   */
+  getNumber(key, defaultValue = 0, options = {}) {
+    const {
+      minValue = null,
+      maxValue = null,
+      allowNegative = false, // 음수 허용 여부
+    } = options;
+
+    const value = process.env[key];
+
+    // 환경 변수가 없으면 기본값 반환
+    if (value === undefined || value === null || value === "") {
+      return defaultValue;
+    }
+
+    const num = Number(value);
+
+    // NaN 또는 Infinity 체크
+    if (!Number.isFinite(num)) {
+      console.warn(
+        `⚠️ 환경변수 ${key}=${value}가 유효하지 않음 → 기본값 ${defaultValue} 사용`
+      );
+      return defaultValue;
+    }
+
+    // 음수 차단 (허용되지 않은 경우)
+    if (!allowNegative && num < 0) {
+      console.warn(
+        `⚠️ 환경변수 ${key}=${num}이 음수임 (허용 안 됨) → 기본값 ${defaultValue} 사용`
+      );
+      return defaultValue;
+    }
+
+    // 최소값 검증
+    if (minValue !== null && num < minValue) {
+      console.warn(
+        `⚠️ 환경변수 ${key}=${num}이 최소값 ${minValue}보다 작음 → 기본값 ${defaultValue} 사용`
+      );
+      return defaultValue;
+    }
+
+    // 최대값 검증
+    if (maxValue !== null && num > maxValue) {
+      console.warn(
+        `⚠️ 환경변수 ${key}=${num}이 최대값 ${maxValue}보다 큼 → 기본값 ${defaultValue} 사용`
+      );
+      return defaultValue;
+    }
+
+    return num;
   }
 
   getBoolean(key, defaultValue = false) {
@@ -42,23 +92,26 @@ class Config {
     return this.get("MARKET");
   }
   get TRADE_CHECK_INTERVAL() {
-    return this.getNumber("TRADE_CHECK_INTERVAL", 5000);
+    return this.getNumber("TRADE_CHECK_INTERVAL", 5000, { minValue: 1000 });
   }
   get RISK_CHECK_INTERVAL() {
-    return this.getNumber("RISK_CHECK_INTERVAL", 1000);
+    return this.getNumber("RISK_CHECK_INTERVAL", 1000, { minValue: 500 });
   }
 
   // === 투자 설정 ===
   get INVESTMENT_RATIO() {
-    return this.getNumber("INVESTMENT_RATIO", 0.999);
+    return this.getNumber("INVESTMENT_RATIO", 0.999, {
+      minValue: 0,
+      maxValue: 1,
+    });
   }
   get MIN_KRW_RESERVE() {
-    return this.getNumber("MIN_KRW_RESERVE", 5000);
+    return this.getNumber("MIN_KRW_RESERVE", 5000, { minValue: 0 });
   }
 
   // === ✅ Dust 처리 ===
   get DUST_THRESHOLD_KRW() {
-    return this.getNumber("DUST_THRESHOLD_KRW", 100);
+    return this.getNumber("DUST_THRESHOLD_KRW", 100, { minValue: 0 });
   }
   get AUTO_IGNORE_DUST() {
     return this.getBoolean("AUTO_IGNORE_DUST", true);
@@ -77,7 +130,7 @@ class Config {
 
   // === ✅ 슬리피지 설정 (스캘핑용) ===
   get EXPECTED_SLIPPAGE() {
-    return this.getNumber("EXPECTED_SLIPPAGE", 0.05); // 0.05% 예상 슬리피지
+    return this.getNumber("EXPECTED_SLIPPAGE", 0.05, { minValue: 0 });
   }
 
   // === 전략 활성화 (스캘핑 전용) ===
@@ -101,10 +154,10 @@ class Config {
 
   // === 진입 설정 (✅ 완화) ===
   get ENTRY_SCORE_THRESHOLD() {
-    return this.getNumber("ENTRY_SCORE_THRESHOLD", 30); // ✅ 40 → 30
+    return this.getNumber("ENTRY_SCORE_THRESHOLD", 30, { minValue: 0 });
   }
   get MIN_SIGNALS() {
-    return this.getNumber("MIN_SIGNALS", 1);
+    return this.getNumber("MIN_SIGNALS", 1, { minValue: 0 });
   }
 
   // === 시장 필터 (✅ 완화) ===
@@ -112,60 +165,60 @@ class Config {
     return this.getBoolean("MARKET_FILTER_ENABLED", true);
   }
   get MARKET_FAVORABLE_THRESHOLD() {
-    return this.getNumber("MARKET_FAVORABLE_THRESHOLD", 40); // ✅ 50 → 40
+    return this.getNumber("MARKET_FAVORABLE_THRESHOLD", 40, { minValue: 0 });
   }
   get BLOCK_HIGH_VOLATILITY() {
     return this.getBoolean("BLOCK_HIGH_VOLATILITY", true);
   }
   get VOLATILITY_THRESHOLD() {
-    return this.getNumber("VOLATILITY_THRESHOLD", 2.0);
+    return this.getNumber("VOLATILITY_THRESHOLD", 2.0, { minValue: 0 });
   }
 
   // === ✅ ATR 변동성 필터 (완화) ===
   get MIN_ATR_THRESHOLD() {
-    return this.getNumber("MIN_ATR_THRESHOLD", 0.2); // ✅ 0.3 → 0.2
+    return this.getNumber("MIN_ATR_THRESHOLD", 0.2, { minValue: 0 });
   }
 
   // === 손절/익절 (✅ 스캘핑 최적화) ===
   get STOP_LOSS_PERCENT() {
-    return this.getNumber("STOP_LOSS_PERCENT", -0.5); // ✅ 타이트한 손절
+    return this.getNumber("STOP_LOSS_PERCENT", -0.5, { allowNegative: true });
   }
   get TAKE_PROFIT_PERCENT() {
-    return this.getNumber("TAKE_PROFIT_PERCENT", 0.8);
+    return this.getNumber("TAKE_PROFIT_PERCENT", 0.8, { minValue: 0 });
   }
   get QUICK_PROFIT_PERCENT() {
-    return this.getNumber("QUICK_PROFIT_PERCENT", 0.8); // ✅ 0.6 → 0.8
+    return this.getNumber("QUICK_PROFIT_PERCENT", 0.8, { minValue: 0 });
   }
   get TRAILING_STOP_ENABLED() {
     return this.getBoolean("TRAILING_STOP_ENABLED", true);
   }
   get TRAILING_STOP_PERCENT() {
-    return this.getNumber("TRAILING_STOP_PERCENT", 0.25);
+    return this.getNumber("TRAILING_STOP_PERCENT", 0.25, { minValue: 0 });
   }
 
   // === 시간 기반 청산 ===
   get MAX_HOLDING_TIME() {
-    return this.getNumber("MAX_HOLDING_TIME", 180);
+    return this.getNumber("MAX_HOLDING_TIME", 180, { minValue: 1 });
   }
   get PROFIT_TIME_LIMIT() {
-    return this.getNumber("PROFIT_TIME_LIMIT", 120);
+    return this.getNumber("PROFIT_TIME_LIMIT", 120, { minValue: 1 });
   }
   get SIDEWAYS_TIME_LIMIT() {
-    return this.getNumber("SIDEWAYS_TIME_LIMIT", 60);
+    return this.getNumber("SIDEWAYS_TIME_LIMIT", 60, { minValue: 1 });
   }
 
   // === ✅ 모멘텀 기반 청산 (수수료+슬리피지 고려) ===
   get MOMENTUM_CHECK_PERIOD() {
-    return this.getNumber("MOMENTUM_CHECK_PERIOD", 20);
+    return this.getNumber("MOMENTUM_CHECK_PERIOD", 20, { minValue: 1 });
   }
   get MOMENTUM_THRESHOLD() {
-    return this.getNumber("MOMENTUM_THRESHOLD", 0.08);
+    return this.getNumber("MOMENTUM_THRESHOLD", 0.08, { minValue: 0 });
   }
   get SIDEWAYS_EXIT_THRESHOLD() {
-    return this.getNumber("SIDEWAYS_EXIT_THRESHOLD", 0.6); // ✅ 수수료+슬리피지 고려
+    return this.getNumber("SIDEWAYS_EXIT_THRESHOLD", 0.6, { minValue: 0 });
   }
   get MIN_PROFIT_FOR_TIME_EXIT() {
-    return this.getNumber("MIN_PROFIT_FOR_TIME_EXIT", 0.6); // ✅ 수수료+슬리피지 고려
+    return this.getNumber("MIN_PROFIT_FOR_TIME_EXIT", 0.6, { minValue: 0 });
   }
 
   // === 역추세 감지 ===
@@ -173,29 +226,29 @@ class Config {
     return this.getBoolean("REVERSE_SIGNAL_CHECK", true);
   }
   get RSI_OVERBOUGHT() {
-    return this.getNumber("RSI_OVERBOUGHT", 70);
+    return this.getNumber("RSI_OVERBOUGHT", 70, { minValue: 0, maxValue: 100 });
   }
 
   // === ✅ 호가창 분석 설정 ===
   get MAX_SPREAD_TICKS() {
-    return this.getNumber("MAX_SPREAD_TICKS", 2); // 최대 2틱 스프레드
+    return this.getNumber("MAX_SPREAD_TICKS", 2, { minValue: 1 });
   }
   get MIN_IMBALANCE() {
-    return this.getNumber("MIN_IMBALANCE", 0.2); // 최소 20% 불균형
+    return this.getNumber("MIN_IMBALANCE", 0.2, { minValue: 0, maxValue: 1 });
   }
   get ORDERBOOK_DEPTH() {
-    return this.getNumber("ORDERBOOK_DEPTH", 10); // 10호가까지 분석
+    return this.getNumber("ORDERBOOK_DEPTH", 10, { minValue: 1, maxValue: 15 });
   }
 
   // === API 재시도 ===
   get API_RETRY_MAX_ATTEMPTS() {
-    return this.getNumber("API_RETRY_MAX_ATTEMPTS", 5);
+    return this.getNumber("API_RETRY_MAX_ATTEMPTS", 5, { minValue: 1 });
   }
   get API_RETRY_DELAY() {
-    return this.getNumber("API_RETRY_DELAY", 2000);
+    return this.getNumber("API_RETRY_DELAY", 2000, { minValue: 100 });
   }
   get API_RETRY_BACKOFF() {
-    return this.getNumber("API_RETRY_BACKOFF", 2.0);
+    return this.getNumber("API_RETRY_BACKOFF", 2.0, { minValue: 1 });
   }
 
   // === 비상 정지 ===
@@ -203,13 +256,17 @@ class Config {
     return this.getBoolean("EMERGENCY_STOP_ENABLED", true);
   }
   get EMERGENCY_PRICE_DROP_PERCENT() {
-    return this.getNumber("EMERGENCY_PRICE_DROP_PERCENT", -10);
+    return this.getNumber("EMERGENCY_PRICE_DROP_PERCENT", -10, {
+      allowNegative: true,
+    });
   }
   get EMERGENCY_NETWORK_TIMEOUT() {
-    return this.getNumber("EMERGENCY_NETWORK_TIMEOUT", 20000);
+    return this.getNumber("EMERGENCY_NETWORK_TIMEOUT", 20000, {
+      minValue: 1000,
+    });
   }
   get EMERGENCY_API_ERROR_THRESHOLD() {
-    return this.getNumber("EMERGENCY_API_ERROR_THRESHOLD", 10);
+    return this.getNumber("EMERGENCY_API_ERROR_THRESHOLD", 10, { minValue: 1 });
   }
 
   // === 로깅 ===

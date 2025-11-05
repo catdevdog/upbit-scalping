@@ -133,7 +133,7 @@ MIN_PROFIT_FOR_TIME_EXIT=0.6  # 시간 제한 청산 최소 수익
 SIDEWAYS_EXIT_THRESHOLD=0.6   # 횡보 청산 최소 수익
 
 # 변동성 필터
-MIN_ATR_THRESHOLD=0.3       # 최소 ATR (진입 조건)
+MIN_ATR_THRESHOLD=0.08       # 최소 ATR (진입 조건)
 
 # 호가창 분석
 MAX_SPREAD_TICKS=2          # 최대 허용 스프레드
