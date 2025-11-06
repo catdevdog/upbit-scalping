@@ -1,600 +1,310 @@
-import config from "./config/env.js";
-import { calculateEntryScore } from "./strategies/index.js";
-import executor from "./trading/executor.js";
-import position from "./trading/position.js";
-import riskManager from "./trading/riskManager.js";
-import stateManager from "./logger/stateManager.js";
-import tradeLogger from "./logger/tradeLogger.js";
-import performanceTracker from "./logger/performanceTracker.js";
-import emergencyMonitor from "./monitor/emergencyStop.js";
-import marketContext from "./strategies/marketContext.js";
-import dashboard from "./logger/dashboardLogger.js";
-import { sleep, log, formatKRW, formatPercent } from "./utils/helpers.js";
+// 메인 루프: 추세 필터 + 본절/트레일링/타임아웃 적용
 
-class UpbitScalpingBot {
-  constructor() {
-    this.isRunning = false;
-    this.riskCheckInterval = null;
-    this.dashboardInterval = null;
-    this.dataUpdateInterval = null;
-    this.priceUpdateInterval = null;
-    this.isProcessingSell = false;
-    this.lastSyncTime = 0;
-    this.syncInterval = 30000;
-  }
+import { CFG } from "./config/index.js";
+import * as Upbit from "./api/upbitAdapter.js";
+import { atrPercent, atrSeriesPercent, atrBandGate } from "./indicators/atr.js";
+import { ema } from "./indicators/ema.js";
+import { vwap } from "./indicators/vwap.js";
+import { analyzeOrderbook } from "./market/orderbook.js";
+import { clamp, nowKSTString } from "./util/math.js";
+import { buildSignal, shouldEnter } from "./strategy/realScalping.js";
+import { Risk } from "./risk/riskManager.js";
+import { Executor } from "./executor/executor.js";
+import { renderDashboard, initTTY } from "./monitor/logger.js";
+import { readExits } from "./monitor/tradeLog.js";
 
-  async initialize() {
-    console.clear();
+process.on("uncaughtException", (e) =>
+  console.error(`❌ Uncaught: ${e?.message}`)
+);
+process.on("unhandledRejection", (e) =>
+  console.error(`❌ UnhandledRejection: ${e}`)
+);
 
-    dashboard.logEvent("INFO", "⚡ 업비트 스캘핑 봇 초기화 중...");
+async function main() {
+  initTTY(); // ← 최초 1회
+  const risk = new Risk();
+  const exe = new Executor(risk);
 
-    log("info", `📈 마켓: ${config.MARKET}`);
-    log("info", `⚡ 모드: SCALPING (전액 매수)`);
-    log(
-      "info",
-      `🛡️ 손절: ${config.STOP_LOSS_PERCENT}% / 익절: ${config.TAKE_PROFIT_PERCENT}%`
-    );
-    log("info", `⏱️ 체크 주기: ${config.TRADE_CHECK_INTERVAL / 1000}초`);
-    log("success", "✅ 스캘핑 전용 시스템 활성화");
-    log("success", "📊 실시간 대시보드 활성화\n");
-
-    await this.checkAndHandleDust();
-
-    const savedState = stateManager.loadState();
-    if (savedState && savedState.position) {
-      position.loadState(savedState.position);
-    }
-
-    await this.syncPosition();
-    await this.updateDashboardData();
-
-    this.isRunning = true;
-
-    dashboard.logEvent("SUCCESS", "초기화 완료! 스캘핑 시작...");
-
-    await sleep(2000);
-  }
-
-  async checkAndHandleDust() {
+  while (true) {
+    const t0 = Date.now();
     try {
-      const currency = config.MARKET.split("-")[1];
-      const coinPosition = await executor.getCoinPosition(config.MARKET);
+      // 데이터
+      const [ob, trades, candles1m, candles5m] = await Promise.all([
+        Upbit.getOrderbook(CFG.run.market),
+        Upbit.getTrades(CFG.run.market, 60),
+        Upbit.getMinuteCandles(1, CFG.run.market, 240),
+        Upbit.getMinuteCandles(5, CFG.run.market, 240),
+      ]);
+      const last =
+        Number(trades?.[0]?.trade_price) || Number(candles1m?.[0]?.c);
+      if (!Number.isFinite(last)) throw new Error("가격 수신 실패");
 
-      if (coinPosition.balance === 0) {
-        log("info", "✅ Dust 없음 - 깨끗한 상태");
-        return;
-      }
-
-      const currentPrice = await executor.getCurrentPrice(config.MARKET);
-      const dustValueKRW = coinPosition.balance * currentPrice;
-
-      log("warn", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      log("warn", "🔍 Dust(잔여 소량) 감지!");
-      log("warn", `   수량: ${coinPosition.balance.toFixed(8)} ${currency}`);
-      log("warn", `   가치: ${formatKRW(dustValueKRW)}`);
-
-      if (dustValueKRW < 100) {
-        log("info", "✅ 100원 미만 소량 - 무시");
-        log("warn", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-        return;
-      }
-
-      log("warn", "🗑️  100원 이상 잔여 - 자동 매도 시작");
-      log("warn", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-
-      const sellResult = await executor.executeSell(
-        config.MARKET,
-        coinPosition.balance,
-        "DUST_CLEANUP",
-        "🗑️ Dust 정리",
-        0
+      // 지표: ATR(1m), RVOL(1m)
+      const atrPct = atrPercent(candles1m, CFG.strat.ATR_PERIOD);
+      const atrHist = atrSeriesPercent(candles1m, CFG.strat.ATR_PERIOD, 180);
+      const band = atrBandGate(
+        atrPct,
+        atrHist,
+        CFG.strat.ATR_P_LO,
+        CFG.strat.ATR_P_HI,
+        CFG.strat.MIN_ATR_PCT
       );
+      const obm = analyzeOrderbook(ob, 10);
 
-      if (sellResult) {
-        log("success", "✅ Dust 자동 매도 완료\n");
-      } else {
-        log("warn", "⚠️ Dust 매도 실패 - 수동 처리 필요\n");
-      }
-    } catch (error) {
-      log("error", "Dust 체크 실패", error.message);
-    }
-  }
+      const vols = candles1m.map((c) => c.v);
+      const avg = (a) => a.reduce((s, x) => s + x, 0) / Math.max(1, a.length);
+      const rvol =
+        avg(vols.slice(0, 5)) /
+        Math.max(1e-9, avg(vols.slice(0, CFG.strat.RVOL_BASE_MIN)));
 
-  async syncPosition() {
-    try {
-      const now = Date.now();
-      if (now - this.lastSyncTime < this.syncInterval) {
-        return;
-      }
+      // RSI 간단
+      const closes = candles1m.map((c) => c.c).slice(0, 60);
+      const diffs = [];
+      for (let i = 1; i < closes.length; i++)
+        diffs.push(closes[i - 1] - closes[i]);
+      const gains = diffs.filter((x) => x > 0).reduce((a, b) => a + b, 0) / 14;
+      const losses =
+        Math.abs(diffs.filter((x) => x < 0).reduce((a, b) => a + b, 0)) / 14;
+      const rs = losses === 0 ? 100 : gains / Math.max(1e-9, losses);
+      const rsi = 100 - 100 / (1 + rs);
 
-      this.lastSyncTime = now;
+      // === 상위 추세 필터 ===
+      const closes5 = candles5m
+        .map((c) => c.c)
+        .slice()
+        .reverse(); // oldest→newest
+      const emaFast = ema(closes5, CFG.strat.TREND_EMA_FAST);
+      const emaSlow = ema(closes5, CFG.strat.TREND_EMA_SLOW);
+      const trendPass =
+        Number.isFinite(emaFast) &&
+        Number.isFinite(emaSlow) &&
+        emaFast > emaSlow;
 
-      const coinPosition = await executor.getCoinPosition(config.MARKET);
+      const vwapVal = vwap(candles1m, 120); // 최근 120분
+      const aboveVWAP = Number.isFinite(vwapVal) ? last >= vwapVal : false;
 
-      if (coinPosition.balance === 0 && position.hasPosition()) {
-        log("warn", "⚠️ 유령 포지션 감지 - 포지션 제거");
-        position.position = null;
-        this.saveState();
-        return;
-      }
+      // 스코어
+      const rsiScore = clamp((rsi - 45) / 20, 0, 1);
+      const volScore = clamp(
+        (rvol - CFG.strat.MIN_RVOL) / (2.5 - CFG.strat.MIN_RVOL),
+        0,
+        1
+      );
+      const obScore = clamp(
+        obm.bestBidShare >= 0.6 &&
+          obm.imbalance >= CFG.strat.MIN_IMB &&
+          obm.spreadTicks <= CFG.strat.MAX_SPREAD_TICKS
+          ? 1
+          : 0.2 + 0.6 * clamp((obm.imbalance - 0.1) / 0.4, 0, 1),
+        0,
+        1
+      );
+      const candleScore = Number.isFinite(atrPct)
+        ? clamp((atrPct - 0.1) / 0.3, 0, 1)
+        : 0;
 
-      if (coinPosition.balance > 0 && !position.hasPosition()) {
-        log("warn", "⚠️ 미동기 포지션 감지 - 복구 시도");
-
-        const currentPrice = await executor.getCurrentPrice(config.MARKET);
-        const currentValueKRW = coinPosition.balance * currentPrice;
-
-        position.openPosition(
-          coinPosition.balance,
-          coinPosition.avgBuyPrice,
-          currentValueKRW
-        );
-        position.updateHighestPrice(coinPosition.avgBuyPrice);
-
-        log("success", "✅ 포지션 복구 완료");
-        this.saveState();
-      }
-    } catch (error) {
-      log("error", "포지션 동기화 실패", error.message);
-    }
-  }
-
-  startRiskMonitoring() {
-    this.riskCheckInterval = setInterval(async () => {
-      if (!position.hasPosition()) return;
-
-      try {
-        const currentPrice = await executor.getCurrentPrice(config.MARKET);
-        position.updatePrice(currentPrice);
-        position.updateHighestPrice(currentPrice);
-
-        const exitInfo = await riskManager.checkExitCondition(currentPrice);
-        if (exitInfo.shouldExit) {
-          await this.executeSell(exitInfo);
-        }
-      } catch (error) {
-        log("error", "손익 체크 실패", error.message);
-      }
-    }, config.RISK_CHECK_INTERVAL);
-  }
-
-  startPriceUpdate() {
-    this.priceUpdateInterval = setInterval(async () => {
-      if (!position.hasPosition()) return;
-
-      try {
-        const currentPrice = await executor.getCurrentPrice(config.MARKET);
-        position.updatePrice(currentPrice);
-        position.updateHighestPrice(currentPrice);
-      } catch (error) {
-        log("error", "가격 업데이트 실패", error.message);
-      }
-    }, 3000);
-  }
-
-  startPriceUpdate() {
-    this.priceUpdateInterval = setInterval(async () => {
-      if (!position.hasPosition()) return;
-
-      try {
-        const currentPrice = await executor.getCurrentPrice(config.MARKET);
-        position.updatePrice(currentPrice);
-        position.updateHighestPrice(currentPrice);
-      } catch (error) {
-        log("error", "가격 업데이트 실패", error.message);
-      }
-    }, 3000);
-  }
-
-  async updateDashboardData() {
-    try {
-      const currentPrice = await executor.getCurrentPrice(config.MARKET);
-      dashboard.updateData("currentPrice", currentPrice);
-
-      // ✅ 수정: analyzeMarket → analyze
-      const context = await marketContext.analyze(config.MARKET);
-      dashboard.updateData("marketContext", context);
-
-      const signals = await calculateEntryScore(config.MARKET);
-      dashboard.updateData("strategySignals", signals);
-
-      if (position.hasPosition()) {
-        dashboard.updateData("position", {
-          hasPosition: true,
-          data: position.getPosition(),
-          currentPrice: currentPrice,
-        });
-      } else {
-        dashboard.updateData("position", { hasPosition: false });
-      }
-
-      dashboard.updateData("stopLoss", config.STOP_LOSS_PERCENT);
-      dashboard.updateData("takeProfit", config.TAKE_PROFIT_PERCENT);
-
-      const performance = performanceTracker.getPerformanceSummary();
-      dashboard.updateData("performance", performance);
-    } catch (error) {
-      log("error", "대시보드 데이터 업데이트 실패", error.message);
-    }
-  }
-
-  async executeBuy(signals, contextScore) {
-    try {
-      const krwBalance = await executor.getAvailableKRW();
-      const buyAmount = executor.calculateBuyAmount(krwBalance);
-
-      if (buyAmount === 0) {
-        dashboard.logEvent(
-          "WARNING",
-          `투자 불가: 잔고 ${formatKRW(krwBalance)}`
-        );
-        return;
-      }
-
-      dashboard.logEvent("BUY", "⚡ 스캘핑 전액 매수 시도", {
-        잔고: formatKRW(krwBalance),
-        매수금액: formatKRW(buyAmount),
-        전략점수: signals.totalScore + "점",
-        시장점수: contextScore + "/100",
+      // 의사결정
+      const p = buildSignal({
+        rsi: rsiScore,
+        vol: volScore,
+        ob: obScore,
+        candle: candleScore,
+      });
+      const dec = shouldEnter(band.pass ? p : 0, {
+        TP: CFG.strat.TP,
+        SL: CFG.strat.SL,
+        FEE: CFG.strat.FEE,
+        SLIP: CFG.strat.SLIP,
       });
 
-      const result = await executor.executeBuy(config.MARKET, buyAmount);
+      const trendGate =
+        trendPass && (!CFG.strat.REQUIRE_VWAP_ABOVE || aboveVWAP);
+      const canEnterNow = !exe.position && band.pass && dec.pass && trendGate;
 
-      if (!result || !result.success) {
-        dashboard.logEvent("WARNING", "매수 실패 - 다음 기회 대기");
-        return;
-      }
-
-      let coinPosition = null;
-      let attempts = 0;
-      const maxAttempts = 5;
-      const delays = [500, 1000, 2000, 3000, 5000];
-
-      while (attempts < maxAttempts) {
-        try {
-          coinPosition = await executor.getCoinPosition(config.MARKET);
-
-          if (coinPosition.balance > 0) {
-            log("success", `✅ 포지션 확인 성공 (${attempts + 1}회 시도)`);
-            break;
-          }
-
-          attempts++;
-          if (attempts < maxAttempts) {
-            const delay = delays[attempts - 1] || 3000;
-            log(
-              "warn",
-              `⚠️ 포지션 확인 실패 (${attempts}/${maxAttempts}) - ${delay}ms 후 재시도...`
-            );
-            await sleep(delay);
-          }
-        } catch (error) {
-          attempts++;
-          log(
-            "error",
-            `포지션 조회 오류 (${attempts}/${maxAttempts}): ${error.message}`
-          );
-
-          if (attempts < maxAttempts) {
-            const delay = delays[attempts - 1] || 3000;
-            await sleep(delay);
-          }
+      // 포지션 관리: 본절/트레일링 → 가격 청산 → 시간 청산
+      if (exe.position) {
+        exe.updateStops(last);
+        const exit1 = exe.maybeExitByPrice(last);
+        if (!exit1) {
+          exe.maybeExitByTime(Date.now(), last);
         }
       }
 
-      if (coinPosition && coinPosition.balance > 0) {
-        position.openPosition(
-          coinPosition.balance,
-          coinPosition.avgBuyPrice,
-          buyAmount
+      if (canEnterNow) {
+        await exe.enterLong({ price: last, atrPct });
+      }
+
+      // 부족/남은 값
+      const deficits = [];
+      if (!trendPass)
+        deficits.push(
+          `추세 부족: EMA${CFG.strat.TREND_EMA_FAST} ≤ EMA${
+            CFG.strat.TREND_EMA_SLOW
+          } (${Math.round(emaFast)} ≤ ${Math.round(emaSlow)})`
         );
-
-        position.updateHighestPrice(coinPosition.avgBuyPrice);
-
-        const currentPrice = await executor.getCurrentPrice(config.MARKET);
-        const immediateProfit =
-          ((currentPrice - coinPosition.avgBuyPrice) /
-            coinPosition.avgBuyPrice) *
-          100;
-
-        dashboard.logEvent("SUCCESS", "✅ 매수 완료!", {
-          수량: coinPosition.balance.toFixed(8),
-          평균단가: formatKRW(coinPosition.avgBuyPrice),
-          현재가: formatKRW(currentPrice),
-          초기손익: formatPercent(immediateProfit),
-        });
-
-        log("info", `🎯 최고가 초기값: ${formatKRW(coinPosition.avgBuyPrice)}`);
-
-        riskManager.resetTracking();
-        this.saveState();
-        await this.updateDashboardData();
-        return;
-      } else {
-        log("warn", "⚠️ 포지션 조회 실패 - 주문 정보로 포지션 생성 시도");
-
-        if (result.executedVolume && result.avgPrice) {
-          log("info", "✅ executor에서 포지션 확인 완료 - 바로 사용");
-
-          position.openPosition(
-            result.executedVolume,
-            result.avgPrice,
-            buyAmount
-          );
-
-          position.updateHighestPrice(result.avgPrice);
-
-          const currentPrice = await executor.getCurrentPrice(config.MARKET);
-          const immediateProfit =
-            ((currentPrice - result.avgPrice) / result.avgPrice) * 100;
-
-          dashboard.logEvent("SUCCESS", "✅ 매수 완료!", {
-            수량: result.executedVolume.toFixed(8),
-            평균단가: formatKRW(result.avgPrice),
-            현재가: formatKRW(currentPrice),
-            초기손익: formatPercent(immediateProfit),
-          });
-
-          log("info", `🎯 최고가 초기값: ${formatKRW(result.avgPrice)}`);
-
-          riskManager.resetTracking();
-          this.saveState();
-          await this.updateDashboardData();
-          return;
-        } else {
-          log(
-            "error",
-            "❌ 매수 완료 후 포지션 생성 실패 - 다음 사이클에서 동기화"
-          );
-          dashboard.logEvent(
-            "ERROR",
-            "매수 완료 후 포지션 생성 실패 - 자동 동기화 대기"
-          );
-
-          // ✅ 대시보드 업데이트 추가
-          await this.updateDashboardData();
-        }
-      }
-    } catch (error) {
-      dashboard.logEvent("ERROR", "매수 실행 오류: " + error.message);
-      emergencyMonitor.recordError();
-
-      // ✅ 에러 발생 시에도 대시보드 업데이트
-      await this.updateDashboardData();
-    }
-  }
-
-  async executeSell(exitInfo) {
-    if (this.isProcessingSell) {
-      log("warn", "⚠️ 매도 이미 진행 중 - 중복 호출 무시");
-      return;
-    }
-
-    this.isProcessingSell = true;
-    const sellStartTime = Date.now();
-
-    try {
-      const pos = position.getPosition();
-      if (!pos) {
-        log("warn", "⚠️ 매도할 포지션 없음");
-        return;
-      }
-
-      const { reason, reasonText, profitRate, price } = exitInfo;
-
-      dashboard.logEvent("SELL", `💸 매도 실행 (${reasonText})`);
-      log("warn", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-      log("warn", `🚨 매도 시작!`);
-      log("warn", `   사유: ${reasonText}`);
-      log("warn", `   수익률: ${formatPercent(profitRate)}`);
-      log("warn", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-
-      const result = await executor.executeSell(
-        config.MARKET,
-        pos.balance,
-        reason,
-        reasonText,
-        profitRate
-      );
-
-      if (!result) {
-        log("error", "❌ 매도 실패");
-        dashboard.logEvent("WARNING", "매도 실패 - 다음 체크에서 재시도");
-        return;
-      }
-
-      log(
-        "success",
-        `✅ executor.executeSell 완료! (${Date.now() - sellStartTime}ms)`
-      );
-
-      if (result.alreadySold) {
-        log("success", "✅ 이미 매도 완료된 상태 확인 - 포지션 제거");
-        position.position = null;
-        this.saveState();
-        await this.updateDashboardData();
-        return;
-      }
-
-      const coinPosition = await executor.getCoinPosition(config.MARKET);
-      if (coinPosition.balance > 0) {
-        log(
-          "warn",
-          `⚠️ 매도 후에도 잔여 수량 존재: ${coinPosition.balance.toFixed(8)}`
+      if (
+        CFG.strat.REQUIRE_VWAP_ABOVE &&
+        !aboveVWAP &&
+        Number.isFinite(vwapVal)
+      ) {
+        const gap = ((vwapVal - last) / vwapVal) * 100;
+        deficits.push(
+          `VWAP 아래: 현재 ${last.toLocaleString()} < VWAP ${Math.round(
+            vwapVal
+          ).toLocaleString()} (격차 ${gap.toFixed(2)}%)`
         );
-        return;
+      }
+      if (
+        !band.pass &&
+        Number.isFinite(atrPct) &&
+        Number.isFinite(band.lo) &&
+        Number.isFinite(band.hi)
+      ) {
+        if (atrPct < band.lo)
+          deficits.push(
+            `ATR 부족: 현재 ${atrPct.toFixed(3)}% → 최소 ${band.lo.toFixed(
+              3
+            )}% (＋${(band.lo - atrPct).toFixed(3)}%)`
+          );
+        if (atrPct > band.hi)
+          deficits.push(
+            `ATR 과열: 현재 ${atrPct.toFixed(3)}% → 최대 ${band.hi.toFixed(
+              3
+            )}% (－${(atrPct - band.hi).toFixed(3)}%)`
+          );
+      }
+      if (rvol < CFG.strat.MIN_RVOL)
+        deficits.push(
+          `거래량 부족: 현재 ${rvol.toFixed(
+            2
+          )}x → 최소 ${CFG.strat.MIN_RVOL.toFixed(2)}x (＋${(
+            CFG.strat.MIN_RVOL - rvol
+          ).toFixed(2)}x)`
+        );
+      if (obm.spreadTicks > CFG.strat.MAX_SPREAD_TICKS)
+        deficits.push(
+          `스프레드 과대: 현재 ${obm.spreadTicks}틱 → 최대 ${
+            CFG.strat.MAX_SPREAD_TICKS
+          }틱 (－${obm.spreadTicks - CFG.strat.MAX_SPREAD_TICKS}틱)`
+        );
+      if (!(band.pass && dec.pass)) {
+        const need = Math.max(0, (dec.pStar - p) * 100);
+        if (need > 0)
+          deficits.push(
+            `확률 부족: 현재 ${(p * 100).toFixed(1)}% → 최소 ${(
+              dec.pStar * 100
+            ).toFixed(1)}% (＋${need.toFixed(1)}%)`
+          );
       }
 
-      const currentPrice = await executor.getCurrentPrice(config.MARKET);
-      const sellAmount = pos.balance * currentPrice;
+      // 승률/최근 체결
+      const { exits, stats } = readExits();
+      const lastTrades = exits.slice(-10);
 
-      const tradeResult = position.closePosition(currentPrice, sellAmount);
-      tradeResult.reason = reason;
+      // 미실현손익·보유시간
+      const unrealized = exe.position
+        ? { pnlKRW: (last - exe.position.entry) * exe.position.size }
+        : { pnlKRW: 0 };
+      const aliveSec = exe.position
+        ? Math.floor((Date.now() - exe.position.entryTs) / 1000)
+        : 0;
 
-      const profit = tradeResult.profit;
-      const finalProfitRate = tradeResult.profitRate;
+      // 대시보드
+      renderDashboard({
+        title: "업비트 스캘핑 Bot v2.2",
+        time: nowKSTString(),
+        market: CFG.run.market,
+        mode: CFG.run.paper ? "PAPER" : "LIVE",
+        price: last,
 
-      tradeLogger.logTrade(tradeResult);
+        // Trend/VWAP
+        trend: {
+          pass: trendGate,
+          emaFast,
+          emaSlow,
+          fastP: CFG.strat.TREND_EMA_FAST,
+          slowP: CFG.strat.TREND_EMA_SLOW,
+          vwap: vwapVal,
+          aboveVWAP,
+        },
 
-      dashboard.logEvent(
-        profit >= 0 ? "SUCCESS" : "WARNING",
-        `✅ 매도 완료! ${reasonText}`,
-        {
-          최종수익률: formatPercent(finalProfitRate),
-          최종수익: formatKRW(profit),
-          매도가: formatKRW(currentPrice),
-          보유시간: tradeResult.holdingMinutes + "분",
-        }
+        // 지표/스코어
+        atrPct,
+        atrLo: band.lo,
+        atrHi: band.hi,
+        atrPass: band.pass,
+        rvol,
+        rvolMin: CFG.strat.MIN_RVOL,
+        obm,
+        scores: {
+          rsi: rsiScore,
+          vol: volScore,
+          ob: obScore,
+          candle: candleScore,
+        },
+
+        // 의사결정
+        p,
+        pStar: dec.pStar,
+        canEnter: canEnterNow,
+
+        // 포지션·성과
+        position: exe.position,
+        unrealized,
+        aliveSec,
+        timeoutSec: CFG.strat.TIMEOUT_SEC,
+
+        // 체결/통계/부족치
+        lastTrades,
+        stats,
+        deficits,
+        showGlossary: CFG.ui.showGlossary,
+      });
+
+      // 슬립
+      const dt = Date.now() - t0;
+      await new Promise((r) =>
+        setTimeout(r, Math.max(0, CFG.run.intervalMs - dt))
       );
-
-      const summary = performanceTracker.getPerformanceSummary();
-      log("info", "");
-      log("info", "📊 누적 통계:");
-      log("info", `   총 거래: ${summary.totalTrades}회`);
-      log("info", `   승률: ${formatPercent(summary.winRate)}`);
-      log("info", `   평균 수익률: ${formatPercent(summary.avgProfit)}`);
-      log("info", `   누적 수익: ${formatKRW(summary.totalProfit)}`);
-      log("info", "");
-
-      this.saveState();
-      await this.updateDashboardData();
-      riskManager.resetTracking();
-
-      log("success", `✅ 매도 전체 완료! (${Date.now() - sellStartTime}ms)`);
-    } catch (error) {
-      dashboard.logEvent("ERROR", "매도 오류: " + error.message);
-      log("error", "executeSell 오류:", error);
-      emergencyMonitor.recordError();
-    } finally {
-      this.isProcessingSell = false;
+    } catch (e) {
+      renderDashboard({
+        title: "업비트 스캘핑 Bot v2.2",
+        time: nowKSTString(),
+        market: CFG.run.market,
+        mode: CFG.run.paper ? "PAPER" : "LIVE",
+        price: 0,
+        trend: {
+          pass: false,
+          emaFast: 0,
+          emaSlow: 0,
+          fastP: CFG.strat.TREND_EMA_FAST,
+          slowP: CFG.strat.TREND_EMA_SLOW,
+          vwap: NaN,
+          aboveVWAP: false,
+        },
+        atrPct: NaN,
+        atrLo: NaN,
+        atrHi: NaN,
+        atrPass: false,
+        rvol: 0,
+        rvolMin: CFG.strat.MIN_RVOL,
+        obm: { imbalance: 0, spreadTicks: 0, bid1: 0, ask1: 0 },
+        scores: { rsi: 0, vol: 0, ob: 0, candle: 0 },
+        p: 0,
+        pStar: 0,
+        canEnter: false,
+        position: null,
+        unrealized: { pnlKRW: 0 },
+        aliveSec: 0,
+        timeoutSec: CFG.strat.TIMEOUT_SEC,
+        lastTrades: [],
+        stats: { wins: 0, losses: 0, winrate: 0, pnl: 0, trades: 0 },
+        deficits: [`루프 오류: ${e?.message}`],
+        showGlossary: CFG.ui.showGlossary,
+      });
+      await new Promise((r) => setTimeout(r, 500));
     }
-  }
-
-  async checkAndTrade() {
-    try {
-      await this.syncPosition();
-
-      if (position.hasPosition()) {
-        return;
-      }
-
-      if (executor.isCurrentlyBuying()) {
-        return;
-      }
-
-      const signals = await calculateEntryScore(config.MARKET);
-
-      // ✅ 수정: analyzeMarket → analyze
-      const context = await marketContext.analyze(config.MARKET);
-
-      if (signals.shouldEnter && context.isFavorable.isFavorable) {
-        dashboard.logEvent("SIGNAL", "🎯 진입 조건 만족!", {
-          전략점수: signals.totalScore + "점",
-          시장점수: context.isFavorable.score + "/100",
-          활성신호: signals.signalCount + "개",
-        });
-
-        await this.executeBuy(signals, context.isFavorable.score);
-      }
-    } catch (error) {
-      dashboard.logEvent("ERROR", "거래 체크 실패: " + error.message);
-      emergencyMonitor.recordError();
-    }
-  }
-  /**
-   * ✅ 대시보드 갱신 - 출력과 데이터 업데이트 분리
-   */
-  startDashboardUpdates() {
-    // 100ms마다 대시보드 출력 (화면 갱신)
-    this.dashboardInterval = setInterval(() => {
-      if (dashboard.shouldPrintDashboard()) {
-        dashboard.printDashboard();
-      }
-    }, 100);
-
-    // 5초마다 데이터 업데이트 (API 호출)
-    this.dataUpdateInterval = setInterval(async () => {
-      await this.updateDashboardData();
-    }, 5000);
-  }
-
-  async updateDashboardData() {
-    try {
-      const currentPrice = await executor.getCurrentPrice(config.MARKET);
-      dashboard.updateData("currentPrice", currentPrice);
-
-      const context = await marketContext.analyze(config.MARKET);
-      dashboard.updateData("marketContext", context);
-
-      const signals = await calculateEntryScore(config.MARKET);
-      dashboard.updateData("strategySignals", signals);
-
-      if (position.hasPosition()) {
-        dashboard.updateData("position", {
-          hasPosition: true,
-          data: position.getPosition(),
-          currentPrice: currentPrice,
-        });
-      } else {
-        dashboard.updateData("position", { hasPosition: false });
-      }
-
-      dashboard.updateData("stopLoss", config.STOP_LOSS_PERCENT);
-      dashboard.updateData("takeProfit", config.TAKE_PROFIT_PERCENT);
-
-      const performance = performanceTracker.getPerformanceSummary();
-      dashboard.updateData("performance", performance);
-    } catch (error) {
-      log("error", "대시보드 데이터 업데이트 실패", error.message);
-    }
-  }
-
-  async run() {
-    await this.initialize();
-    this.startRiskMonitoring();
-    this.startPriceUpdate();
-    this.startDashboardUpdates();
-
-    while (this.isRunning) {
-      await this.checkAndTrade();
-      await sleep(config.TRADE_CHECK_INTERVAL);
-    }
-  }
-
-  saveState() {
-    stateManager.saveState({
-      position: position.getState(),
-    });
-  }
-
-  async stop() {
-    dashboard.logEvent("INFO", "프로그램 종료 중...");
-    this.isRunning = false;
-
-    if (this.riskCheckInterval) clearInterval(this.riskCheckInterval);
-    if (this.dashboardInterval) clearInterval(this.dashboardInterval);
-    if (this.dataUpdateInterval) clearInterval(this.dataUpdateInterval);
-    if (this.priceUpdateInterval) clearInterval(this.priceUpdateInterval);
-
-    this.saveState();
-    dashboard.logEvent("SUCCESS", "안전하게 종료되었습니다");
-    process.exit(0);
   }
 }
 
-const bot = new UpbitScalpingBot();
-
-process.on("SIGINT", () => bot.stop());
-process.on("SIGTERM", () => bot.stop());
-process.on("unhandledRejection", (error) => {
-  dashboard.logEvent("ERROR", "Unhandled Rejection: " + error.message);
-});
-process.on("uncaughtException", (error) => {
-  dashboard.logEvent("ERROR", "Uncaught Exception: " + error.message);
-  bot.stop();
-});
-
-bot.run().catch((error) => {
-  dashboard.logEvent("ERROR", "프로그램 실행 실패: " + error.message);
-  process.exit(1);
-});
+main();
