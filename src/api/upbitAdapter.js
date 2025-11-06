@@ -1,9 +1,79 @@
-// 업비트 REST (시세 + 실거래) — JWT 서명 포함
+// 업비트 REST (429 자동 백오프 추가) v2.0
 import crypto from "crypto";
 import { buckets } from "../core/rateLimiter.js";
 import { KEYS } from "../config/index.js";
 
 const BASE = "https://api.upbit.com/v1";
+
+// ===== 429 백오프 래퍼 =====
+async function fetchWithBackoff(url, options, bucket, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      await bucket.take();
+      const res = await fetch(url, options);
+
+      // 429 Too Many Requests
+      if (res.status === 429) {
+        bucket.report429();
+
+        const retryAfter = res.headers.get("Retry-After");
+        const waitMs = retryAfter
+          ? parseInt(retryAfter) * 1000
+          : Math.min(10000, 500 * Math.pow(2, attempt)); // 지수 백오프
+
+        if (attempt < maxRetries) {
+          console.warn(
+            `⚠️ 429 Too Many Requests, ${Math.ceil(
+              waitMs / 1000
+            )}초 대기... (시도 ${attempt + 1}/${maxRetries})`
+          );
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        } else {
+          throw new Error(
+            `API 레이트리미트 초과 (429) - ${maxRetries}회 재시도 실패`
+          );
+        }
+      }
+
+      // 5xx 서버 오류 (일시적)
+      if (res.status >= 500) {
+        if (attempt < maxRetries) {
+          const waitMs = 1000 * Math.pow(1.5, attempt);
+          console.warn(
+            `⚠️ 서버 오류 ${res.status}, ${Math.ceil(
+              waitMs / 1000
+            )}초 후 재시도...`
+          );
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+      }
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status} ${url}: ${text}`);
+      }
+
+      return res.json();
+    } catch (err) {
+      if (err.name === "TypeError" && err.message.includes("fetch")) {
+        // 네트워크 오류
+        if (attempt < maxRetries) {
+          const waitMs = 1000 * Math.pow(1.5, attempt);
+          console.warn(
+            `⚠️ 네트워크 오류, ${Math.ceil(waitMs / 1000)}초 후 재시도...`
+          );
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+      }
+      throw err;
+    }
+  }
+
+  throw new Error(`최대 재시도 횟수 초과: ${url}`);
+}
 
 // ===== 공용(시세) =====
 async function httpGet(path, params, bucket) {
@@ -17,10 +87,14 @@ async function httpGet(path, params, bucket) {
         )
       )
     : "";
-  await bucket.take();
-  const res = await fetch(BASE + path + qs);
-  if (!res.ok) throw new Error(`HTTP ${res.status} ${path}`);
-  return res.json();
+
+  return fetchWithBackoff(
+    BASE + path + qs,
+    {
+      headers: { accept: "application/json" },
+    },
+    bucket
+  );
 }
 
 export async function getOrderbook(market) {
@@ -28,9 +102,11 @@ export async function getOrderbook(market) {
     await httpGet("/orderbook", { markets: market }, buckets.orderbook)
   )[0];
 }
+
 export async function getTrades(market, count = 50) {
   return httpGet("/trades/ticks", { market, count }, buckets.trades);
 }
+
 export async function getMinuteCandles(unit, market, count = 200) {
   const raw = await httpGet(
     `/candles/minutes/${unit}`,
@@ -54,6 +130,7 @@ const b64u = (buf) =>
     .replace(/=+/g, "")
     .replace(/\+/g, "-")
     .replace(/\//g, "_");
+
 function signJWT(payload, secret) {
   const header = { alg: "HS256", typ: "JWT" };
   const data = `${b64u(JSON.stringify(header))}.${b64u(
@@ -68,16 +145,16 @@ function signJWT(payload, secret) {
     .replace(/\//g, "_");
   return `${data}.${sig}`;
 }
+
 function qsFrom(body) {
-  // 업비트는 본문을 "쿼리 문자열 형태"로 해시. 키 정렬로 결정적 생성.
   const entries = Object.entries(body)
     .filter(([, v]) => v !== undefined && v !== null)
     .map(([k, v]) => [k, String(v)]);
   entries.sort(([a], [b]) => a.localeCompare(b));
   return new URLSearchParams(entries).toString();
 }
+
 async function httpPrivate(path, method, body) {
-  await buckets.exchange.take();
   const query = body ? qsFrom(body) : "";
   const hash = crypto.createHash("sha512").update(query, "utf8").digest("hex");
   const jwt = signJWT(
@@ -89,25 +166,22 @@ async function httpPrivate(path, method, body) {
     },
     KEYS.secret
   );
-  const res = await fetch(BASE + path, {
-    method,
-    headers: {
-      Authorization: `Bearer ${jwt}`,
-      "Content-Type": "application/json",
+
+  return fetchWithBackoff(
+    BASE + path,
+    {
+      method,
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: body ? JSON.stringify(body) : undefined,
     },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`HTTP ${res.status} ${path}: ${text}`);
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
-  }
+    buckets.exchange
+  );
 }
 
 // ===== 주문 함수 =====
-// KRW 시장가 매수: KRW 금액으로 즉시 체결
 export async function placeMarketBuyKRW({ market, krw }) {
   const body = {
     market,
@@ -117,7 +191,7 @@ export async function placeMarketBuyKRW({ market, krw }) {
   };
   return httpPrivate("/orders", "POST", body);
 }
-// 시장가 매도: 보유 수량으로 즉시 매도
+
 export async function placeMarketSell({ market, volume }) {
   const body = {
     market,
@@ -127,7 +201,7 @@ export async function placeMarketSell({ market, volume }) {
   };
   return httpPrivate("/orders", "POST", body);
 }
-// 지정가 매수(원하면 사용)
+
 export async function placeLimitBuy({ market, price, volume }) {
   const body = {
     market,
@@ -140,7 +214,6 @@ export async function placeLimitBuy({ market, price, volume }) {
 }
 
 export async function getOpenOrders({ market } = {}) {
-  // GET /orders/open 은 쿼리도 해시 포함
   const params = market ? { market } : {};
   const query = new URLSearchParams(params).toString();
   const hash = crypto.createHash("sha512").update(query, "utf8").digest("hex");
@@ -154,12 +227,13 @@ export async function getOpenOrders({ market } = {}) {
     KEYS.secret
   );
 
-  await buckets.exchange.take();
-  const res = await fetch(`${BASE}/orders/open${query ? `?${query}` : ""}`, {
-    headers: { Authorization: `Bearer ${jwt}` },
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status} /orders/open`);
-  return res.json();
+  return fetchWithBackoff(
+    `${BASE}/orders/open${query ? `?${query}` : ""}`,
+    {
+      headers: { Authorization: `Bearer ${jwt}` },
+    },
+    buckets.exchange
+  );
 }
 
 export const hasKeys = () => Boolean(KEYS.access && KEYS.secret);
