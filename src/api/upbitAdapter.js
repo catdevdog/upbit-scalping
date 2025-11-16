@@ -2,6 +2,8 @@
 import crypto from "crypto";
 import { buckets } from "../core/rateLimiter.js";
 import { KEYS } from "../config/index.js";
+import { connectUpbitWS, MarketSnapshot } from "../core/ws.js";
+import { maybeBackoffByHeader } from "../core/rateLimiter.js";
 
 const BASE = "https://api.upbit.com/v1";
 
@@ -147,16 +149,54 @@ function signJWT(payload, secret) {
 }
 
 function qsFrom(body) {
-  const entries = Object.entries(body)
-    .filter(([, v]) => v !== undefined && v !== null)
-    .map(([k, v]) => [k, String(v)]);
-  entries.sort(([a], [b]) => a.localeCompare(b));
-  return new URLSearchParams(entries).toString();
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(body)) {
+    if (value === undefined || value === null) continue;
+    params.append(key, String(value));
+  }
+  return params.toString();
+}
+
+const toNumberString = (value, decimals, mode = "floor") => {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return String(value);
+  if (decimals == null) return String(num);
+  const pow = Math.pow(10, decimals);
+  let adjusted;
+  if (mode === "ceil") adjusted = Math.ceil(num * pow) / pow;
+  else if (mode === "round") adjusted = Math.round(num * pow) / pow;
+  else adjusted = Math.floor(num * pow) / pow;
+  const fixed = adjusted.toFixed(decimals);
+  const trimmed = fixed.replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");
+  return trimmed === "" ? "0" : trimmed;
+};
+
+function normalizeOrderBody(body) {
+  if (!body) return body;
+  const normalized = {};
+  for (const [key, value] of Object.entries(body)) {
+    if (value === undefined || value === null) continue;
+    if (key === "volume") {
+      normalized[key] = toNumberString(value, 8, "floor");
+      continue;
+    }
+    if (key === "price" || key === "krw") {
+      normalized[key] = toNumberString(value);
+      continue;
+    }
+    normalized[key] = typeof value === "string" ? value : String(value);
+  }
+  return normalized;
 }
 
 async function httpPrivate(path, method, body) {
-  const query = body ? qsFrom(body) : "";
-  const hash = crypto.createHash("sha512").update(query, "utf8").digest("hex");
+  const normalized = normalizeOrderBody(body);
+  const query = normalized ? qsFrom(normalized) : "";
+  const hashBase = normalized ? query : "";
+  const hash = crypto
+    .createHash("sha512")
+    .update(hashBase, "utf8")
+    .digest("hex");
   const jwt = signJWT(
     {
       access_key: KEYS.access,
@@ -173,9 +213,14 @@ async function httpPrivate(path, method, body) {
       method,
       headers: {
         Authorization: `Bearer ${jwt}`,
-        "Content-Type": "application/json",
+        ...(normalized
+          ? {
+              "Content-Type":
+                "application/x-www-form-urlencoded; charset=utf-8",
+            }
+          : {}),
       },
-      body: body ? JSON.stringify(body) : undefined,
+      body: normalized ? query : undefined,
     },
     buckets.exchange
   );
@@ -237,3 +282,120 @@ export async function getOpenOrders({ market } = {}) {
 }
 
 export const hasKeys = () => Boolean(KEYS.access && KEYS.secret);
+
+export async function getAccounts() {
+  if (!hasKeys()) throw new Error("API 키가 없습니다.");
+  const jwt = signJWT(
+    {
+      access_key: KEYS.access,
+      nonce: crypto.randomUUID(),
+    },
+    KEYS.secret
+  );
+  return fetchWithBackoff(
+    `${BASE}/accounts`,
+    {
+      headers: { Authorization: `Bearer ${jwt}` },
+    },
+    buckets.exchange
+  );
+}
+
+export async function getOrderDetail(uuid) {
+  if (!hasKeys()) throw new Error("API 키가 없습니다.");
+  if (!uuid) throw new Error("getOrderDetail: uuid 누락");
+  const params = { uuid };
+  const query = qsFrom(params);
+  const hash = crypto.createHash("sha512").update(query, "utf8").digest("hex");
+  const jwt = signJWT(
+    {
+      access_key: KEYS.access,
+      nonce: crypto.randomUUID(),
+      query_hash: hash,
+      query_hash_alg: "SHA512",
+    },
+    KEYS.secret
+  );
+  return fetchWithBackoff(
+    `${BASE}/order?${query}`,
+    {
+      headers: { Authorization: `Bearer ${jwt}` },
+    },
+    buckets.exchange
+  );
+}
+
+// --- WS snapshot + ultra wrappers ---
+const snapshots = new Map();
+
+export function ensureWS(market) {
+  if (snapshots.has(market)) return snapshots.get(market);
+  const snap = new MarketSnapshot();
+  connectUpbitWS({
+    codes: [market],
+    onMessage: ({ type, payload, lagMs }) =>
+      snap.update({ type, payload, lagMs }),
+  });
+  snapshots.set(market, snap);
+  return snap;
+}
+
+async function withBackoff(fn) {
+  const res = await fn();
+  try {
+    await maybeBackoffByHeader(res?.headers);
+  } catch {}
+  return res;
+}
+
+export async function orderbook(market) {
+  const snap = ensureWS(market);
+  if (snap.orderbook) return snap.orderbook;
+  const res = await withBackoff(() => getOrderbook(market));
+  return res;
+}
+
+export async function trades(market, count = 50) {
+  const snap = ensureWS(market);
+  if (snap.trade) return [snap.trade];
+  const res = await withBackoff(() => getTrades(market, count));
+  return res;
+}
+
+export async function placeOrder(params) {
+  if (!params) throw new Error("missing params");
+  const { market, side, price, volume, ord_type, krw } = params;
+  if (ord_type === "limit")
+    return withBackoff(() => placeLimitBuy({ market, price, volume }));
+  if (ord_type === "price" || ord_type === "market" || krw) {
+    if (side === "bid")
+      return withBackoff(() =>
+        placeMarketBuyKRW({ market, krw: krw ?? price })
+      );
+    if (side === "ask")
+      return withBackoff(() => placeMarketSell({ market, volume }));
+  }
+  if (placeLimitBuy)
+    return withBackoff(() => placeLimitBuy({ market, price, volume }));
+  throw new Error("placeOrder: unsupported");
+}
+
+export async function getOrder(uuid) {
+  try {
+    const open = await withBackoff(() => getOpenOrders());
+    return open.find((o) => o.uuid === uuid) ?? null;
+  } catch (e) {
+    return null;
+  }
+}
+
+export async function cancelOrder(uuid) {
+  // Cancel order via private DELETE /orders with body { uuid }
+  if (!uuid) throw new Error("cancelOrder: missing uuid");
+  return httpPrivate("/orders", "DELETE", { uuid });
+}
+
+export function getWsLagMs(market) {
+  const snap = snapshots.get(market);
+  return snap?.wsLagMs ?? null;
+}

@@ -94,6 +94,29 @@ export function parseRemaining(val) {
   return { group, sec, min };
 }
 
+// ultra helpers: Remaining-Req 파싱(간단형) 및 헤더 기반 백오프
+export function parseRemainingReq(header) {
+  if (!header) return { sec: null, min: null };
+  const sec = Number(/sec=(\d+)/.exec(header)?.[1] ?? NaN);
+  const min = Number(/min=(\d+)/.exec(header)?.[1] ?? NaN);
+  return {
+    sec: Number.isFinite(sec) ? sec : null,
+    min: Number.isFinite(min) ? min : null,
+  };
+}
+
+export async function maybeBackoffByHeader(headers) {
+  const rr = headers?.get?.("Remaining-Req") ?? headers?.["remaining-req"];
+  const { sec } = parseRemainingReq(rr);
+  if (sec == null) return;
+  if (sec <= 2) await sleep(300);
+  else if (sec <= 4) await sleep(150);
+}
+
+export function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 // 통계 리포트 (디버깅용)
 export function reportBucketStats() {
   console.log("\n📊 API 사용량 통계:");

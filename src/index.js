@@ -24,20 +24,36 @@ async function main() {
   initTTY(); // ← 최초 1회
   const risk = new Risk();
   const exe = new Executor(risk);
+  await exe.refreshBalance(true, CFG.run.market);
+  const gateStats = {
+    attempts: 0,
+    gatingPass: 0,
+    entries: 0,
+    atrFail: 0,
+    rvolFail: 0,
+    spreadFail: 0,
+    probFail: 0,
+    trendFail: 0,
+    momentumUsed: 0,
+  };
 
+  const snap = Upbit.ensureWS(CFG.run.market);
   while (true) {
     const t0 = Date.now();
     try {
-      // 데이터
-      const [ob, trades, candles1m, candles5m] = await Promise.all([
-        Upbit.getOrderbook(CFG.run.market),
-        Upbit.getTrades(CFG.run.market, 60),
-        Upbit.getMinuteCandles(1, CFG.run.market, 240),
-        Upbit.getMinuteCandles(5, CFG.run.market, 240),
-      ]);
+      // 데이터: WS 스냅샷 우선 사용 (ultra loop)
+      const ob = snap.orderbook ?? (await Upbit.getOrderbook(CFG.run.market));
+      const trades = snap.trade
+        ? [snap.trade]
+        : await Upbit.getTrades(CFG.run.market, 60);
+      const candles1m = await Upbit.getMinuteCandles(1, CFG.run.market, 240);
+      const candles5m = await Upbit.getMinuteCandles(5, CFG.run.market, 240);
       const last =
         Number(trades?.[0]?.trade_price) || Number(candles1m?.[0]?.c);
       if (!Number.isFinite(last)) throw new Error("가격 수신 실패");
+
+      await exe.refreshBalance(false, CFG.run.market);
+      exe.reconcileExposure(last, CFG.run.market);
 
       // 지표: ATR(1m), RVOL(1m)
       const atrPct = atrPercent(candles1m, CFG.strat.ATR_PERIOD);
@@ -68,6 +84,30 @@ async function main() {
       const rs = losses === 0 ? 100 : gains / Math.max(1e-9, losses);
       const rsi = 100 - 100 / (1 + rs);
 
+      const closeNow = Number(candles1m?.[0]?.c);
+      const closePrev = Number(candles1m?.[1]?.c);
+      const closePrev3 = Number(candles1m?.[3]?.c);
+      const priceDelta1 =
+        Number.isFinite(closeNow) && Number.isFinite(closePrev) && closePrev > 0
+          ? (closeNow - closePrev) / closePrev
+          : 0;
+      const momentumSlope =
+        Number.isFinite(closeNow) &&
+        Number.isFinite(closePrev3) &&
+        closePrev3 > 0
+          ? (closeNow - closePrev3) / closePrev3
+          : 0;
+      const atrTightMin = Math.max(CFG.strat.MIN_ATR_PCT + 0.015, 0.05);
+      const atrTightPass = Number.isFinite(atrPct) && atrPct >= atrTightMin;
+      const rsiStrong = Number.isFinite(rsi) && rsi >= 60;
+      const fastMomentum = priceDelta1 >= 0.001 || momentumSlope >= 0.0015;
+      const risingAcceleration =
+        fastMomentum && priceDelta1 >= momentumSlope * 0.7;
+      const lossMomentum =
+        Number.isFinite(momentumSlope) && Number.isFinite(priceDelta1)
+          ? momentumSlope <= priceDelta1 * 0.3
+          : false;
+
       // === 상위 추세 필터 ===
       const closes5 = candles5m
         .map((c) => c.c)
@@ -85,11 +125,13 @@ async function main() {
 
       // 스코어
       const rsiScore = clamp((rsi - 45) / 20, 0, 1);
-      const volScore = clamp(
-        (rvol - CFG.strat.MIN_RVOL) / (2.5 - CFG.strat.MIN_RVOL),
-        0,
-        1
-      );
+      let volScore;
+      if (rvol >= 1.9) volScore = 1;
+      else if (rvol >= 1.6)
+        volScore = 0.7 + clamp((rvol - 1.6) / 0.3, 0, 1) * 0.3;
+      else if (rvol >= 1.3)
+        volScore = 0.4 + clamp((rvol - 1.3) / 0.3, 0, 1) * 0.3;
+      else volScore = clamp((rvol - 1.0) / 0.3, 0, 1) * 0.4;
       const obScore = clamp(
         obm.bestBidShare >= 0.6 &&
           obm.imbalance >= CFG.strat.MIN_IMB &&
@@ -104,34 +146,122 @@ async function main() {
         : 0;
 
       // 의사결정
-      const p = buildSignal({
+      const probRaw = buildSignal({
         rsi: rsiScore,
         vol: volScore,
         ob: obScore,
         candle: candleScore,
       });
-      const dec = shouldEnter(band.pass ? p : 0, {
-        TP: CFG.strat.TP,
-        SL: CFG.strat.SL,
-        FEE: CFG.strat.FEE,
-        SLIP: CFG.strat.SLIP,
-      });
+      const rvolPass = rvol >= CFG.strat.MIN_RVOL;
+      const spreadPass = obm.spreadTicks <= CFG.strat.MAX_SPREAD_TICKS;
+      const gatingPass = band.pass && rvolPass && spreadPass;
+      const dec = shouldEnter(gatingPass ? probRaw : 0);
 
       const trendGate =
         trendPass && (!CFG.strat.REQUIRE_VWAP_ABOVE || aboveVWAP);
-      const canEnterNow = !exe.position && band.pass && dec.pass && trendGate;
+      const hasExposure = exe.hasOpenExposure();
+      const evaluatingEntry = !hasExposure;
+      const probBuffer = Math.min(0.98, dec.pStar + 0.05);
+      const momentumProb = Math.min(0.98, dec.pStar + 0.02);
+      const momentumStrong =
+        obScore >= 0.9 &&
+        rvol >= CFG.strat.MIN_RVOL + 0.3 &&
+        atrTightPass &&
+        (rsiStrong || fastMomentum) &&
+        risingAcceleration &&
+        momentumSlope >= 0.0015;
+      const trendStrengthPass =
+        trendGate &&
+        !lossMomentum &&
+        (fastMomentum || risingAcceleration || momentumSlope >= 0.0012);
+      const momentumOverride =
+        !trendGate && gatingPass && momentumStrong && probRaw >= momentumProb;
+      const passesTrendOrMomentum = trendStrengthPass || momentumOverride;
+      const trendProbBump = fastMomentum || risingAcceleration ? 0.02 : 0.04;
+      const requiredProb = trendStrengthPass
+        ? Math.min(0.98, Math.max(probBuffer, dec.pStar + trendProbBump))
+        : probBuffer;
+      const probPass =
+        dec.pass &&
+        ((trendStrengthPass && probRaw >= requiredProb) ||
+          (!trendGate && probRaw >= probBuffer) ||
+          momentumOverride);
+      const canEnterNow =
+        evaluatingEntry && gatingPass && probPass && passesTrendOrMomentum;
+
+      if (evaluatingEntry) {
+        gateStats.attempts += 1;
+        if (!band.pass) gateStats.atrFail += 1;
+        else if (!rvolPass) gateStats.rvolFail += 1;
+        else if (!spreadPass) gateStats.spreadFail += 1;
+        else {
+          gateStats.gatingPass += 1;
+          if (!passesTrendOrMomentum) gateStats.trendFail += 1;
+          else if (!probPass) gateStats.probFail += 1;
+        }
+      }
 
       // 포지션 관리: 본절/트레일링 → 가격 청산 → 시간 청산
       if (exe.position) {
         exe.updateStops(last);
-        const exit1 = exe.maybeExitByPrice(last);
+        const exit1 = await exe.maybeExitByPrice(last);
         if (!exit1) {
-          exe.maybeExitByTime(Date.now(), last);
+          await exe.maybeExitByTime(Date.now(), last);
         }
       }
 
       if (canEnterNow) {
-        await exe.enterLong({ price: last, atrPct });
+        const entryCtx = {
+          atrPct,
+          atrLo: band.lo,
+          atrHi: band.hi,
+          atrTightMin,
+          atrTightPass,
+          atrPass: band.pass,
+          rvol,
+          rvolPass,
+          spreadTicks: obm.spreadTicks,
+          spreadPass,
+          prob: probRaw,
+          pStar: dec.pStar,
+          probPass,
+          probBuffer,
+          requiredProb,
+          trendStrengthPass,
+          trendPass,
+          trendGate,
+          momentumOverride,
+          momentumProb,
+          momentumStrong,
+          rsi,
+          rsiStrong,
+          priceDelta1,
+          momentumSlope,
+          fastMomentum,
+          risingAcceleration,
+          lossMomentum,
+          trendMomentumAligned: trendStrengthPass,
+          gatingPass,
+          rsiScore,
+          volScore,
+          obScore,
+          candleScore,
+          imbalance: obm.imbalance,
+          bestBidShare: obm.bestBidShare,
+          aboveVWAP,
+          timeoutSec: CFG.strat.TIMEOUT_SEC,
+          stallSec: CFG.strat.STALL_SEC,
+          price: last,
+        };
+        const entryRes = await exe.enterLong({
+          price: last,
+          atrPct,
+          context: entryCtx,
+        });
+        if (entryRes?.ok) {
+          gateStats.entries += 1;
+          if (!trendGate && momentumOverride) gateStats.momentumUsed += 1;
+        }
       }
 
       // 부족/남은 값
@@ -173,7 +303,7 @@ async function main() {
             )}% (－${(atrPct - band.hi).toFixed(3)}%)`
           );
       }
-      if (rvol < CFG.strat.MIN_RVOL)
+      if (!rvolPass)
         deficits.push(
           `거래량 부족: 현재 ${rvol.toFixed(
             2
@@ -181,38 +311,107 @@ async function main() {
             CFG.strat.MIN_RVOL - rvol
           ).toFixed(2)}x)`
         );
-      if (obm.spreadTicks > CFG.strat.MAX_SPREAD_TICKS)
+      if (!spreadPass)
         deficits.push(
           `스프레드 과대: 현재 ${obm.spreadTicks}틱 → 최대 ${
             CFG.strat.MAX_SPREAD_TICKS
           }틱 (－${obm.spreadTicks - CFG.strat.MAX_SPREAD_TICKS}틱)`
         );
-      if (!(band.pass && dec.pass)) {
-        const need = Math.max(0, (dec.pStar - p) * 100);
+      if (gatingPass && !probPass) {
+        const targetProb = trendGate ? requiredProb : probBuffer;
+        const need = Math.max(0, (targetProb - probRaw) * 100);
         if (need > 0)
           deficits.push(
-            `확률 부족: 현재 ${(p * 100).toFixed(1)}% → 최소 ${(
-              dec.pStar * 100
+            `확률 부족: 현재 ${(probRaw * 100).toFixed(1)}% → 최소 ${(
+              targetProb * 100
             ).toFixed(1)}% (＋${need.toFixed(1)}%)`
+          );
+      }
+      if (!passesTrendOrMomentum) {
+        if (!trendGate)
+          deficits.push(
+            `추세 필터 미충족: 모멘텀 예외 조건(ATR ≥ ${(
+              atrTightMin * 100
+            ).toFixed(2)}bp, OB ≥ 0.90, RVOL ≥ ${(
+              CFG.strat.MIN_RVOL + 0.3
+            ).toFixed(2)}x, RSI ≥ 60, 가속도 양호)을 만족하지 못함`
+          );
+        if (!atrTightPass && !trendGate)
+          deficits.push(
+            `모멘텀 예외 차단: ATR ${
+              atrPct?.toFixed?.(3) ?? "NaN"
+            }% → 최소 ${atrTightMin.toFixed(3)}% 필요`
+          );
+        if (!(obScore >= 0.9) && !trendGate)
+          deficits.push(
+            `모멘텀 예외 차단: 오더북 스코어 ${obScore.toFixed(
+              2
+            )} → 최소 0.90 필요`
+          );
+        if (!trendStrengthPass && trendGate)
+          deficits.push(
+            `추세 진입 보류: 속도 부족 (Δ1=${(priceDelta1 * 100).toFixed(
+              2
+            )}bp, slope=${(momentumSlope * 100).toFixed(2)}bp, 가속 ${
+              risingAcceleration ? "충족" : "부족"
+            })`
+          );
+        if (!momentumOverride && !trendGate)
+          deficits.push(
+            `모멘텀 예외 거부: 상승 가속도 부족 (Δ1=${(
+              priceDelta1 * 100
+            ).toFixed(2)}bp, slope=${(momentumSlope * 100).toFixed(
+              2
+            )}bp, 요구 확률 ${(momentumProb * 100).toFixed(1)}%)`
           );
       }
 
       // 승률/최근 체결
       const { exits, stats } = readExits();
+      const nowStr = nowKSTString();
+      const todayKey = nowStr.slice(0, 10);
+      const todayExits = exits.filter(
+        (e) => typeof e.ts === "string" && e.ts.slice(0, 10) === todayKey
+      );
+      const daily = {
+        trades: todayExits.length,
+        wins: todayExits.filter((e) => Number(e.pnlKRW) > 0).length,
+        losses: todayExits.filter((e) => Number(e.pnlKRW) <= 0).length,
+        pnl: todayExits.reduce((s, e) => s + Number(e.pnlKRW || 0), 0),
+      };
       const lastTrades = exits.slice(-10);
 
+      // 최근 오류/시스템 이벤트
+      const sysLog = [];
+      if (exe.lastError) {
+        sysLog.push({ ts: exe.lastError.ts, msg: exe.lastError.message });
+      }
+
+      const account = exe.accountSnapshot(last);
+      if (exe.orderHistory?.length) {
+        for (const evt of exe.orderHistory.slice(-10)) {
+          const msg = evt.err || evt.msg || evt.type || "event";
+          sysLog.push({ ts: evt.ts, msg });
+        }
+      }
+
       // 미실현손익·보유시간
-      const unrealized = exe.position
-        ? { pnlKRW: (last - exe.position.entry) * exe.position.size }
-        : { pnlKRW: 0 };
+      const pnlKRW = exe.position
+        ? (last - exe.position.entry) * exe.position.size
+        : 0;
+      const pnlPct =
+        exe.position && exe.position.entry
+          ? ((last - exe.position.entry) / exe.position.entry) * 100
+          : 0;
+      const unrealized = { pnlKRW, pnlPct };
       const aliveSec = exe.position
         ? Math.floor((Date.now() - exe.position.entryTs) / 1000)
         : 0;
 
       // 대시보드
       renderDashboard({
-        title: "업비트 스캘핑 Bot v2.2",
-        time: nowKSTString(),
+        title: "업비트 스캘핑 Bot v3.0",
+        time: nowStr,
         market: CFG.run.market,
         mode: CFG.run.paper ? "PAPER" : "LIVE",
         price: last,
@@ -244,9 +443,17 @@ async function main() {
         },
 
         // 의사결정
-        p,
+        p: probRaw,
         pStar: dec.pStar,
         canEnter: canEnterNow,
+        filters: {
+          atr: band.pass,
+          rvol: rvolPass,
+          spread: spreadPass,
+          gatingPass,
+        },
+        gateStats,
+        daily,
 
         // 포지션·성과
         position: exe.position,
@@ -259,6 +466,8 @@ async function main() {
         stats,
         deficits,
         showGlossary: CFG.ui.showGlossary,
+        systemLog: sysLog,
+        account,
       });
 
       // 슬립
@@ -268,7 +477,7 @@ async function main() {
       );
     } catch (e) {
       renderDashboard({
-        title: "업비트 스캘핑 Bot v2.2",
+        title: "업비트 스캘핑 Bot v3.0",
         time: nowKSTString(),
         market: CFG.run.market,
         mode: CFG.run.paper ? "PAPER" : "LIVE",
@@ -293,14 +502,16 @@ async function main() {
         p: 0,
         pStar: 0,
         canEnter: false,
+        gateStats,
         position: null,
-        unrealized: { pnlKRW: 0 },
+        unrealized: { pnlKRW: 0, pnlPct: 0 },
         aliveSec: 0,
         timeoutSec: CFG.strat.TIMEOUT_SEC,
         lastTrades: [],
         stats: { wins: 0, losses: 0, winrate: 0, pnl: 0, trades: 0 },
         deficits: [`루프 오류: ${e?.message}`],
         showGlossary: CFG.ui.showGlossary,
+        systemLog: [{ ts: nowKSTString(), msg: e?.stack ?? String(e) }],
       });
       await new Promise((r) => setTimeout(r, 500));
     }

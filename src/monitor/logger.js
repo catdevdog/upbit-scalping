@@ -1,6 +1,8 @@
 // 대시보드 렌더러 — 깜빡임 저감 + 확장된 용어 설명(친절/가독성 강화)
 import { nowKSTString, clamp } from "../util/math.js";
 import { CFG } from "../config/index.js";
+import { getWsLagMs } from "../api/upbitAdapter.js";
+import { parseRemainingReq } from "../core/rateLimiter.js";
 
 const WIDTH = 30;
 const C = {
@@ -20,6 +22,18 @@ export const yellow = (s) => color(s, C.yellow);
 export const cyan = (s) => color(s, C.cyan);
 export const bold = (s) => color(s, C.bold);
 export const dim = (s) => color(s, C.dim);
+
+const fmtSignedKRW = (value) => {
+  const val = Number.isFinite(value) ? value : 0;
+  const sign = val > 0 ? "+" : val < 0 ? "-" : "";
+  return `${sign}${Math.round(Math.abs(val)).toLocaleString()} KRW`;
+};
+const fmtPnlKRW = (value) => {
+  const val = Number.isFinite(value) ? value : 0;
+  return val >= 0
+    ? green("+" + Math.round(Math.abs(val)).toLocaleString())
+    : red("-" + Math.round(Math.abs(val)).toLocaleString());
+};
 
 let __prevBuf = "";
 let __lastTs = 0;
@@ -74,7 +88,7 @@ function glossary(d) {
   const lines = [];
 
   lines.push(bar);
-  lines.push(bold("ℹ 용어 설명(핵심 지표)"));
+  lines.push(bold("ℹ 용어 설명(핵심 지표) — v3.0"));
   lines.push(
     `${cyan("• RSI")}: 모멘텀(0~100). 50↑ 강세 경향, 70↑ 과열 경향. ` +
       `대시보드 막대는 45~65 구간 중심으로 정규화된 스코어입니다.`
@@ -166,6 +180,16 @@ export function renderDashboard(d) {
   if (now - __lastTs < CFG.ui.minRenderMs) return;
   __lastTs = now;
 
+  // WS lag & Remaining-Req quick log
+  try {
+    const wsLag = getWsLagMs(d.market);
+    const rr = d.lastHeaders?.get?.("Remaining-Req") ?? d.lastRemainingReq;
+    const { sec, min } = parseRemainingReq(rr ?? "");
+    if (wsLag != null) console.log(`[WS] lag_ms=${wsLag}`);
+    if (sec != null)
+      console.log(`[RATE] remaining.sec=${sec} remaining.min=${min ?? "n/a"}`);
+  } catch (e) {}
+
   const out = [];
   const line = (s = "") => out.push(s);
 
@@ -183,18 +207,66 @@ export function renderDashboard(d) {
   );
 
   // 상태·가격
+  const pctFmt = (pct) => `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`;
   const status = d.position
-    ? green("보유 중") +
-      `  entry ${Math.round(
+    ? `${green("보유 중")}  entry ${Math.round(
         d.position.entry
       ).toLocaleString()}  TP ${Math.round(
         d.position.tp
-      ).toLocaleString()}  SL ${Math.round(d.position.sl).toLocaleString()}`
+      ).toLocaleString()} (${pctFmt(
+        (d.position.tp / d.position.entry - 1) * 100
+      )})  SL ${Math.round(d.position.sl).toLocaleString()} (${pctFmt(
+        (d.position.sl / d.position.entry - 1) * 100
+      )})`
     : d.canEnter
     ? green("즉시 진입 가능")
     : yellow("대기");
   line(`\n🧭 상태: ${status}`);
   line(`💰 가격: ${d.price.toLocaleString()} KRW`);
+
+  if (d.account) {
+    const {
+      balanceKRW,
+      lockedKRW = 0,
+      positionValue,
+      equityKRW,
+      realizedKRW,
+      mode,
+    } = d.account;
+    line(
+      `💳 계좌(${mode ?? "-"}): 가용 ${fmtSignedKRW(
+        balanceKRW
+      )}  |  잠금 ${fmtSignedKRW(lockedKRW)}  |  포지션 ${fmtSignedKRW(
+        positionValue
+      )}  |  총합 ${fmtSignedKRW(equityKRW)}`
+    );
+    line(`   ↳ 실현손익: ${fmtPnlKRW(realizedKRW)} KRW`);
+  }
+
+  const targetLine = `🎯 목표: +${(CFG.strat.TP * 100).toFixed(2)}% / -${(
+    CFG.strat.SL * 100
+  ).toFixed(2)}%  |  BE ${(CFG.strat.BE_TRIGGER * 100).toFixed(2)}% → ${(
+    CFG.strat.BE_OFFSET * 100
+  ).toFixed(2)}%  |  Trail ${(CFG.strat.TRAIL_PCT * 100).toFixed(
+    2
+  )}%  |  Timeout ${CFG.strat.TIMEOUT_SEC}s (stall ${CFG.strat.STALL_SEC}s)`;
+  line(targetLine);
+
+  if (d.position) {
+    const toTp = d.position.tp - d.price;
+    const toSl = d.price - d.position.sl;
+    line(
+      `   ↳ 남은 거리: TP ${
+        toTp >= 0
+          ? `${green("+" + Math.round(Math.abs(toTp)).toLocaleString())}`
+          : `${red("-" + Math.round(Math.abs(toTp)).toLocaleString())}`
+      } KRW  /  SL ${
+        toSl >= 0
+          ? `${red("-" + Math.round(Math.abs(toSl)).toLocaleString())}`
+          : `${green("+" + Math.round(Math.abs(toSl)).toLocaleString())}`
+      } KRW`
+    );
+  }
 
   // Trend/VWAP
   const trendTxt = d.trend?.pass ? green("PASS") : red("FAIL");
@@ -225,6 +297,15 @@ export function renderDashboard(d) {
     }  b1/a1=${d.obm.bid1}/${d.obm.ask1}`
   );
 
+  if (d.filters) {
+    const fmt = (ok) => (ok ? green("PASS") : red("FAIL"));
+    line(
+      `\n🧰 필터: ATR ${fmt(d.filters.atr)}  RVOL ${fmt(
+        d.filters.rvol
+      )}  Spread ${fmt(d.filters.spread)}`
+    );
+  }
+
   // 부족치
   if (d.deficits?.length) {
     line(`\n❗ 부족/조건 미충족:`);
@@ -253,9 +334,23 @@ export function renderDashboard(d) {
     }`
   );
 
+  if (d.gateStats?.attempts) {
+    const gs = d.gateStats;
+    const passRate = gs.attempts
+      ? ((gs.gatingPass / gs.attempts) * 100).toFixed(1)
+      : "0.0";
+    line(
+      `\n📊 진입 모니터: 시도 ${gs.attempts} / 통과 ${gs.gatingPass} (${passRate}%) / 체결 ${gs.entries}`
+    );
+    line(
+      `   ↳ 실패 ATR ${gs.atrFail} · RVOL ${gs.rvolFail} · Spread ${gs.spreadFail} · Prob ${gs.probFail} · Trend ${gs.trendFail} · Momentum ${gs.momentumUsed}`
+    );
+  }
+
   // 미실현·타임아웃
   if (d.position) {
     const ur = d.unrealized?.pnlKRW ?? 0;
+    const urPct = d.unrealized?.pnlPct ?? 0;
     const alive = Math.max(0, d.aliveSec | 0);
     const remain = Math.max(0, (d.timeoutSec | 0) - alive);
     line(
@@ -263,7 +358,7 @@ export function renderDashboard(d) {
         ur >= 0
           ? green("+" + Math.round(ur).toLocaleString())
           : red(Math.round(ur).toLocaleString())
-      } KRW`
+      } KRW  (${urPct >= 0 ? green(pctFmt(urPct)) : red(pctFmt(urPct))})`
     );
     line(`⏳ 보유시간: ${alive}s  |  타임아웃까지: ${remain}s`);
   }
@@ -283,6 +378,19 @@ export function renderDashboard(d) {
     }
   }
 
+  // 시스템/에러 로그
+  const sysLog = d.systemLog ?? [];
+  line(`\n⚠ 최근 이벤트/오류`);
+  if (!sysLog.length) {
+    line(`   - 없음`);
+  } else {
+    for (const evt of sysLog.slice(-5)) {
+      const ts = evt.ts ?? "?";
+      const msg = evt.msg ?? evt.err ?? JSON.stringify(evt);
+      line(`   - ${ts}  ${msg}`);
+    }
+  }
+
   // 누적 성과
   const wr = (d.stats.winrate * 100).toFixed(1);
   const cum =
@@ -292,6 +400,16 @@ export function renderDashboard(d) {
   line(
     `\n🏁 누적: 거래 ${d.stats.trades}건, 승 ${d.stats.wins} 패 ${d.stats.losses}, 승률 ${wr}%  |  누적 P&L ${cum} KRW\n`
   );
+  if (d.daily) {
+    const targetRange = `${CFG.run.targetTradesMin}-${CFG.run.targetTradesMax}`;
+    const dailyPnlTxt =
+      d.daily.pnl >= 0
+        ? green("+" + Math.round(d.daily.pnl).toLocaleString())
+        : red(Math.round(d.daily.pnl).toLocaleString());
+    line(
+      `   ↳ 오늘: 거래 ${d.daily.trades}건 (목표 ${targetRange}) · 승 ${d.daily.wins} 패 ${d.daily.losses} · P&L ${dailyPnlTxt} KRW`
+    );
+  }
 
   // 용어 설명
   if (d.showGlossary) out.push(...glossary(d));

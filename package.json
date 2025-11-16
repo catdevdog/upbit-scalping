@@ -5,7 +5,8 @@
   "main": "src/index.js",
   "type": "module",
   "scripts": {
-    "start": "dotenv -e .env -- node src/index.js"
+    "start": "dotenv -e .env -- node src/index.js",
+    "analyze:timeouts": "dotenv -e .env -- node scripts/analyze-timeouts.js"
   },
   "keywords": [
     "upbit",
@@ -17,6 +18,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "ws": "^8.18.0",
     "axios": "^1.6.0",
     "cross-env": "^7.0.3",
     "dotenv": "^16.3.1",

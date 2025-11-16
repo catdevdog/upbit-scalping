@@ -19,6 +19,10 @@ function loadDotenv() {
         (v.startsWith("'") && v.endsWith("'"))
       )
         v = v.slice(1, -1);
+      else {
+        const hash = v.indexOf("#");
+        if (hash >= 0) v = v.slice(0, hash).trim();
+      }
       if (!(k in process.env)) process.env[k] = v;
     }
   } catch {}
@@ -30,31 +34,34 @@ const env = (k, d) => process.env[k] ?? d;
 export const CFG = {
   run: {
     market: env("MARKET", "KRW-BTC"),
-    intervalMs: Number(env("INTERVAL_MS", "1000")),
+    intervalMs: Number(env("INTERVAL_MS", "400")),
     paper: env("PAPER", "true") === "true",
+    targetTradesMin: Number(env("TARGET_TRADES_MIN", "12")),
+    targetTradesMax: Number(env("TARGET_TRADES_MAX", "25")),
   },
   strat: {
-    TP: Number(env("TP", "0.006")),
-    SL: Number(env("SL", "0.005")),
+    TP: Number(env("TP", "0.0040")),
+    SL: Number(env("SL", "0.0030")),
     FEE: Number(env("FEE", "0.0010")),
     SLIP: Number(env("SLIP", "0.0005")),
     ATR_PERIOD: Number(env("ATR_PERIOD", "14")),
-    ATR_P_LO: Number(env("ATR_P_LO", "0.40")),
-    ATR_P_HI: Number(env("ATR_P_HI", "0.90")),
-    MIN_ATR_PCT: Number(env("MIN_ATR_PCT", "0.08")),
+    ATR_P_LO: Number(env("ATR_P_LO", "0.26")),
+    ATR_P_HI: Number(env("ATR_P_HI", "0.85")),
+    MIN_ATR_PCT: Number(env("MIN_ATR_PCT", "0.055")),
     RVOL_BASE_MIN: Number(env("RVOL_BASE_MIN", "120")),
-    MIN_RVOL: Number(env("MIN_RVOL", "1.5")),
+    MIN_RVOL: Number(env("MIN_RVOL", "1.6")),
     MAX_SPREAD_TICKS: Number(env("MAX_SPREAD_TICKS", "2")),
-    MIN_IMB: Number(env("MIN_IMB", "0.2")),
+    MIN_IMB: Number(env("MIN_IMB", "0.20")),
 
     // 우선순위 4개
     TREND_EMA_FAST: Number(env("TREND_EMA_FAST", "20")),
     TREND_EMA_SLOW: Number(env("TREND_EMA_SLOW", "50")),
-    REQUIRE_VWAP_ABOVE: env("REQUIRE_VWAP_ABOVE", "true") === "true",
-    TIMEOUT_SEC: Number(env("TIMEOUT_SEC", "180")),
-    BE_TRIGGER: Number(env("BE_TRIGGER", "0.0025")),
-    BE_OFFSET: Number(env("BE_OFFSET", "0.0005")),
-    TRAIL_PCT: Number(env("TRAIL_PCT", "0.0025")),
+    REQUIRE_VWAP_ABOVE: env("REQUIRE_VWAP_ABOVE", "false") === "true",
+    TIMEOUT_SEC: Number(env("TIMEOUT_SEC", "80")),
+    STALL_SEC: Number(env("STALL_SEC", "55")),
+    BE_TRIGGER: Number(env("BE_TRIGGER", "0.0015")),
+    BE_OFFSET: Number(env("BE_OFFSET", "0.0003")),
+    TRAIL_PCT: Number(env("TRAIL_PCT", "0.0016")),
   },
   log: {
     dir: env("LOG_DIR", "./logs"),
@@ -78,4 +85,11 @@ export const PATHS = {
 export const KEYS = {
   access: env("UPBIT_ACCESS_KEY", ""),
   secret: env("UPBIT_SECRET_KEY", ""),
+};
+
+// 파생: 손익분기 승률 p* = (SL+FEE+SLIP)/(TP+SL)
+export const DERIVED = {
+  pRequired:
+    (CFG.strat.SL + CFG.strat.FEE + CFG.strat.SLIP) /
+    (CFG.strat.TP + CFG.strat.SL),
 };
