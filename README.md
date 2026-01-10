@@ -9,7 +9,7 @@ v3.0은 **실거래 주문 경로(JWT)**, **대시보드·용어 설명 강화**
 
 ## 목차
 
-INTERVAL_MS=400
+INTERVAL_MS=300
 
 - [요구 사항](#요구-사항)
 - [설치](#설치)
@@ -34,9 +34,10 @@ INTERVAL_MS=400
 - **주문 경로**: 업비트 JWT 인증, 시장가/지정가 지원
 - **확률 임계치**: \(p \ge p^\*\), 대시보드에 실시간 표기  
   \(p^\*=\frac{\text{SL}+\text{FEE}+\text{SLIP}}{\text{TP}+\text{SL}}\)
-- **청산 로직**: TP/SL, 본절 이동(BE), 트레일링(TRAIL), 타임아웃
+- **청산 로직**: TP/SL, 본절 이동(BE), 스톨(STALL), 트레일링(TRAIL), 타임아웃
 - **대시보드**: 저깜빡임 렌더링, 최근 10건 체결, 승률·누적 P&L, 용어 설명(v3.0 갱신)
 - **분석 도구**: “진입 조건 최초 성립” 시간대 히스토그램(KST)
+- **승률 우선 자동 튜너**: ATR/RVOL/Orderbook 데이터를 실시간으로 읽어 TP·SL·STALL·TIMEOUT 및 RVOL/스프레드/imb 기준을 “이론상 승률이 가장 높은” 방향으로 자동 재설정
 
 ---
 
@@ -69,34 +70,37 @@ APP_VERSION=3.0
 
 # 실행/시장
 MARKET=KRW-BTC
-INTERVAL_MS=400
+INTERVAL_MS=300
 PAPER=true
+TARGET_TRADES_MIN=18
+TARGET_TRADES_MAX=35
 
 # 전략(초단타 프리셋)
-TP=0.0040
-SL=0.0030
-FEE=0.0010
-SLIP=0.0005
+TP=0.0008          # +0.08% 익절
+SL=0.0012          # -0.12% 손절
+FEE=0.0005
+SLIP=0.0003
 
 ATR_PERIOD=14
-ATR_P_LO=0.26
-ATR_P_HI=0.85
-MIN_ATR_PCT=0.055
+ATR_P_LO=0.25
+ATR_P_HI=0.70
+MIN_ATR_PCT=0.035
 
-RVOL_BASE_MIN=120
-MIN_RVOL=1.6
+RVOL_BASE_MIN=60
+MIN_RVOL=1.4
 
-TREND_EMA_FAST=20
-TREND_EMA_SLOW=50
-REQUIRE_VWAP_ABOVE=false
+TREND_EMA_FAST=15
+TREND_EMA_SLOW=40
+REQUIRE_VWAP_ABOVE=true
 
-MAX_SPREAD_TICKS=2
-MIN_IMB=0.20
+MAX_SPREAD_TICKS=1
+MIN_IMB=0.25
 
-TIMEOUT_SEC=35
-BE_TRIGGER=0.0015
-BE_OFFSET=0.0003
-TRAIL_PCT=0.0016
+TIMEOUT_SEC=22
+STALL_SEC=12
+BE_TRIGGER=0.0005
+BE_OFFSET=0.0002
+TRAIL_PCT=0.0008
 
 # 로그/UI
 LOG_DIR=./logs
@@ -121,22 +125,22 @@ ANALYZE_RPS=4
 | ----------------------------- | --------------------------- | ------------------------ |
 | `APP_NAME`, `APP_VERSION`     | 대시보드 타이틀             | 업비트 스캘핑 Bot, 3.0   |
 | `MARKET`                      | 거래 마켓                   | `KRW-BTC`                |
-| `INTERVAL_MS`                 | 루프 간격(ms)               | `400`                    |
+| `INTERVAL_MS`                 | 루프 간격(ms)               | `300`                    |
 | `PAPER`                       | 모의거래 여부               | `true`                   |
-| `TP`, `SL`                    | 익절·손절(비율)             | `0.0040`, `0.0030`       |
-| `FEE`, `SLIP`                 | 왕복 수수료·평균 슬리피지   | `0.0010`, `0.0005`       |
+| `TP`, `SL`                    | 익절·손절(비율)             | `0.0008`, `0.0012`       |
+| `FEE`, `SLIP`                 | 왕복 수수료·평균 슬리피지   | `0.0005`, `0.0003`       |
 | `ATR_PERIOD`                  | ATR 기간(분)                | `14`                     |
-| `ATR_P_LO`, `ATR_P_HI`        | ATR 분위수 하·상한          | `0.26`, `0.85`           |
-| `MIN_ATR_PCT`                 | 최소 ATR%(절대 하한)        | `0.055`                  |
-| `RVOL_BASE_MIN`               | RVOL 기준 구간(분)          | `120`                    |
-| `MIN_RVOL`                    | 최소 RVOL                   | `1.6`                    |
-| `TREND_EMA_FAST/SLOW`         | 5분봉 EMA 20/50             | `20`, `50`               |
-| `REQUIRE_VWAP_ABOVE`          | 가격 ≥ VWAP 요구 여부       | `false`                  |
-| `MAX_SPREAD_TICKS`            | 허용 스프레드 틱            | `2`                      |
-| `MIN_IMB`                     | 최소 호가 불균형(매수 우위) | `0.20`                   |
-| `TIMEOUT_SEC`                 | 보유 시간 제한              | `35`                     |
-| `BE_TRIGGER/BE_OFFSET`        | 본절 이동 트리거·오프셋     | `0.0015`, `0.0003`       |
-| `TRAIL_PCT`                   | 트레일링 폭                 | `0.0016`                 |
+| `ATR_P_LO`, `ATR_P_HI`        | ATR 분위수 하·상한          | `0.25`, `0.70`           |
+| `MIN_ATR_PCT`                 | 최소 ATR%(절대 하한)        | `0.035`                  |
+| `RVOL_BASE_MIN`               | RVOL 기준 구간(분)          | `60`                     |
+| `MIN_RVOL`                    | 최소 RVOL                   | `1.4`                    |
+| `TREND_EMA_FAST/SLOW`         | 5분봉 EMA 15/40             | `15`, `40`               |
+| `REQUIRE_VWAP_ABOVE`          | 가격 ≥ VWAP 요구 여부       | `true`                   |
+| `MAX_SPREAD_TICKS`            | 허용 스프레드 틱            | `1`                      |
+| `MIN_IMB`                     | 최소 호가 불균형(매수 우위) | `0.25`                   |
+| `TIMEOUT_SEC`, `STALL_SEC`    | 보유·스톨 제한(s)           | `22`, `12`               |
+| `BE_TRIGGER/BE_OFFSET`        | 본절 이동 트리거·오프셋     | `0.0005`, `0.0002`       |
+| `TRAIL_PCT`                   | 트레일링 폭                 | `0.0008`                 |
 | `LOG_DIR`, `TRADE_LOG`        | 로그 폴더/파일명            | `./logs`, `trades.jsonl` |
 | `SHOW_GLOSSARY`               | 용어 설명 표시              | `true`                   |
 | `USE_ALT_SCREEN`              | 대체 화면 버퍼 사용         | `true`                   |
@@ -145,6 +149,8 @@ ANALYZE_RPS=4
 | `ANALYZE_DAYS`                | 분석 일수                   | `14`                     |
 | `ANALYZE_IGNORE_OB`           | 과거 분석 시 호가조건 무시  | `true`                   |
 | `ANALYZE_RPS`                 | 분석 호출 RPS               | `4`                      |
+
+> ⚠️ `TP`, `SL`, `TIMEOUT_SEC`, `STALL_SEC`, `MIN_RVOL`, `MAX_SPREAD_TICKS`, `MIN_IMB` 는 이제 **동적 승률 튜너의 바닥값**입니다. 런타임에서는 ATR·RVOL·호가 상태에 따라 이 값 이상으로 자동 상향되어, 항상 수수료를 제외하고도 “이론상 승률이 최대”인 조합을 사용합니다.
 
 ---
 
@@ -196,11 +202,24 @@ PAPER=false node src/index.js
 
 ### 청산 우선순위
 
-1. **손절(SL)**: −0.30%
-2. **익절(TP)**: +0.40%
-3. **본절 이동(BE)**: +0.15% 도달 시 손절을 진입가(+0.03%) 근처로 이동
-4. **트레일링(TRAIL)**: 고점 대비 −0.16% 이탈 시 청산
-5. **타임아웃**: `TIMEOUT_SEC`(기본 35초) 경과 시 시장가 정리
+1. **손절(SL)**: −0.28% (동적 비율 적용)
+2. **익절(TP)**: +0.15%
+3. **본절 이동(BE)**: +0.05% 도달 시 손절을 진입가(+0.025%) 근처로 이동
+4. **트레일링(TRAIL)**: 고점 대비 −0.12% 이탈 시 청산
+5. **스톨(STALL)**: `STALL_SEC`(기본 14초, 동적 6~30초) 동안 BE 위로 복귀하지 못하면 강제 정리
+6. **타임아웃**: `TIMEOUT_SEC`(기본 26초, 동적 15~50초) 경과 시 시장가 정리
+
+### 승률 지향 자동 튜너 (Win-Bias Optimizer)
+
+봇이 루프를 돌 때마다 **ATR%·RVOL·호가 스프레드/imbalance**를 입력으로 받아, “수수료를 제하고도 승률이 가장 높아지는” 방향으로 파라미터를 재설정합니다.
+
+- **TP/SL 재계산**: ATR·수수료를 반영해 `TP ≈ 0.12~0.36%`, `SL ≈ TP×(1.3~2.0)` 범위로 산출해 일반적인 스캘핑 손익비를 유지합니다.
+- **p\*** 업데이트: 새 TP/SL 값을 즉시 반영해 `p* = (SL+FEE+SLIP)/(TP+SL)`를 계산하고, 승률 임계치를 **0.55~0.72** 사이로 자동 제한합니다.
+- **시간 제한**: 예상 도달 시간(`TP / ATR`)을 역산해 STALL/TIMEOUT을 6~24초, 14~40초 범위에서 조정합니다.
+- **필터 조정**: RVOL/스프레드/imb 바닥값을 시장 강도에 따라 동적으로 1.12~1.65배, 1~2틱, 0.20~0.40으로 맞춰 일반 스캘핑 빈도를 확보합니다.
+- **대시보드/로그 연동**: 새 목표치는 `🎯 목표(동적)`과 Glossary의 `p*`에 즉시 반영되며, 체결 로그(`entryCtx.targets`)에 그대로 남습니다.
+
+따라서 `.env` 값은 “최소한 이 정도는 지켜라”는 바닥선으로만 쓰이며, 실거래에서는 항상 이론상 승률이 우위인 조합으로 자동 운용됩니다.
 
 ### 운영 프로파일(권장값)
 
@@ -261,7 +280,7 @@ node scripts/analyze-entry-windows.js --days=14 --ignore-ob=true --rps=4
 - **신규 키**
 
   - `ATR_P_LO`, `ATR_P_HI`, `RVOL_BASE_MIN`, `REQUIRE_VWAP_ABOVE`
-  - `TIMEOUT_SEC`, `BE_TRIGGER`, `BE_OFFSET`, `TRAIL_PCT`
+  - `TIMEOUT_SEC`, `STALL_SEC`, `BE_TRIGGER`, `BE_OFFSET`, `TRAIL_PCT`
   - UI: `USE_ALT_SCREEN`, `MIN_RENDER_MS`, `SHOW_GLOSSARY`
 
 - **대시보드**: 용어 설명 패널, 최근 10건, 승률/누적 P&L

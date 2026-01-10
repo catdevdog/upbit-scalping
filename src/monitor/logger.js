@@ -79,8 +79,8 @@ function glossary(d) {
     "────────────────────────────────────────────────────────────────────────────────";
   const num = (x, p = 3) => (Number.isFinite(x) ? x.toFixed(p) : "NaN");
 
-  const tp = Number(CFG.strat.TP);
-  const sl = Number(CFG.strat.SL);
+  const tp = Number(d?.dynamicTargets?.tpPct ?? CFG.strat.TP);
+  const sl = Number(d?.dynamicTargets?.slPct ?? CFG.strat.SL);
   const fee = Number(CFG.strat.FEE);
   const slip = Number(CFG.strat.SLIP);
   const pStar = d?.pStar ?? (sl + fee + slip) / (tp + sl);
@@ -243,13 +243,18 @@ export function renderDashboard(d) {
     line(`   ↳ 실현손익: ${fmtPnlKRW(realizedKRW)} KRW`);
   }
 
-  const targetLine = `🎯 목표: +${(CFG.strat.TP * 100).toFixed(2)}% / -${(
-    CFG.strat.SL * 100
-  ).toFixed(2)}%  |  BE ${(CFG.strat.BE_TRIGGER * 100).toFixed(2)}% → ${(
+  const dynTargets = d.dynamicTargets ?? {};
+  const tpPct = (dynTargets.tpPct ?? CFG.strat.TP) * 100;
+  const slPct = (dynTargets.slPct ?? CFG.strat.SL) * 100;
+  const timeoutSec = dynTargets.timeoutSec ?? CFG.strat.TIMEOUT_SEC;
+  const stallSec = dynTargets.stallSec ?? CFG.strat.STALL_SEC;
+  const targetLine = `🎯 목표(동적): +${tpPct.toFixed(2)}% / -${slPct.toFixed(
+    2
+  )}%  |  BE ${(CFG.strat.BE_TRIGGER * 100).toFixed(2)}% → ${(
     CFG.strat.BE_OFFSET * 100
   ).toFixed(2)}%  |  Trail ${(CFG.strat.TRAIL_PCT * 100).toFixed(
     2
-  )}%  |  Timeout ${CFG.strat.TIMEOUT_SEC}s (stall ${CFG.strat.STALL_SEC}s)`;
+  )}%  |  Timeout ${timeoutSec}s (stall ${stallSec}s)`;
   line(targetLine);
 
   if (d.position) {

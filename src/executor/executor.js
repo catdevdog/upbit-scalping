@@ -527,6 +527,18 @@ export class Executor {
     const tsEpoch = Date.now();
     const tsISO = new Date(tsEpoch).toISOString();
     const ctx = context ? { ...context } : undefined;
+    const targetTPPct = Number.isFinite(ctx?.targets?.tpPct)
+      ? ctx.targets.tpPct
+      : CFG.strat.TP;
+    const targetSLPct = Number.isFinite(ctx?.targets?.slPct)
+      ? ctx.targets.slPct
+      : CFG.strat.SL;
+    const targetTimeout = Number.isFinite(ctx?.targets?.timeoutSec)
+      ? ctx.targets.timeoutSec
+      : CFG.strat.TIMEOUT_SEC;
+    const targetStall = Number.isFinite(ctx?.targets?.stallSec)
+      ? ctx.targets.stallSec
+      : CFG.strat.STALL_SEC;
     const positionId = ++this._positionSeq;
     const atrPctRaw = Number(ctx?.atrPct);
     const atrFrac =
@@ -552,8 +564,8 @@ export class Executor {
       entry,
       sizeKRW: spend,
       size: cleanSize,
-      tp: entry * (1 + CFG.strat.TP),
-      sl: entry * (1 - CFG.strat.SL),
+      tp: entry * (1 + targetTPPct),
+      sl: entry * (1 - targetSLPct),
       entryTs: tsEpoch,
       movedToBE: false,
       trailHigh: entry,
@@ -563,6 +575,8 @@ export class Executor {
       beFloorPct,
       stallFloorPct,
       stallGraceUsed: false,
+      timeoutSec: targetTimeout,
+      stallSec: targetStall,
     };
 
     this._updateBaseHoldings(market, cleanSize, 0);
@@ -843,7 +857,9 @@ export class Executor {
     if (!this.position) return null;
     const { size, entryTs, movedToBE, entry, stallGraceUsed } = this.position;
     const alive = (nowTs - entryTs) / 1000;
-    const stallSec = CFG.strat.STALL_SEC;
+    const stallSec = Number.isFinite(this.position.stallSec)
+      ? this.position.stallSec
+      : CFG.strat.STALL_SEC;
     const feeFloorPct = Math.max(
       CFG.strat.BE_OFFSET,
       CFG.strat.FEE + CFG.strat.SLIP
@@ -880,7 +896,10 @@ export class Executor {
       return this.forceExit(last, "STALL", market);
     }
 
-    if (alive >= CFG.strat.TIMEOUT_SEC) {
+    const timeoutSec = Number.isFinite(this.position.timeoutSec)
+      ? this.position.timeoutSec
+      : CFG.strat.TIMEOUT_SEC;
+    if (alive >= timeoutSec) {
       if (this.paperMode()) {
         return this.finalizeExit({
           reason: "TIMEOUT",

@@ -12,6 +12,7 @@ import { Risk } from "./risk/riskManager.js";
 import { Executor } from "./executor/executor.js";
 import { renderDashboard, initTTY } from "./monitor/logger.js";
 import { readExits } from "./monitor/tradeLog.js";
+import { deriveWinBiasTargets } from "./core/winBiasOptimizer.js";
 
 process.on("uncaughtException", (e) =>
   console.error(`❌ Uncaught: ${e?.message}`)
@@ -38,6 +39,7 @@ async function main() {
   };
 
   const snap = Upbit.ensureWS(CFG.run.market);
+  let lastWinBias = null;
   while (true) {
     const t0 = Date.now();
     try {
@@ -72,6 +74,26 @@ async function main() {
       const rvol =
         avg(vols.slice(0, 5)) /
         Math.max(1e-9, avg(vols.slice(0, CFG.strat.RVOL_BASE_MIN)));
+      const winBias = deriveWinBiasTargets({
+        atrPct,
+        rvol,
+        spreadTicks: obm.spreadTicks,
+        imbalance: obm.imbalance,
+        feePct: CFG.strat.FEE,
+        slipPct: CFG.strat.SLIP,
+        base: {
+          minRvol: CFG.strat.MIN_RVOL,
+          maxSpreadTicks: CFG.strat.MAX_SPREAD_TICKS,
+          minImb: CFG.strat.MIN_IMB,
+          stallSec: CFG.strat.STALL_SEC,
+          timeoutSec: CFG.strat.TIMEOUT_SEC,
+        },
+      });
+      lastWinBias = winBias;
+      const dynRvolMin = winBias.minRvol ?? CFG.strat.MIN_RVOL;
+      const dynSpreadTicks =
+        winBias.maxSpreadTicks ?? CFG.strat.MAX_SPREAD_TICKS;
+      const dynMinImb = winBias.minImb ?? CFG.strat.MIN_IMB;
 
       // RSI 간단
       const closes = candles1m.map((c) => c.c).slice(0, 60);
@@ -134,10 +156,10 @@ async function main() {
       else volScore = clamp((rvol - 1.0) / 0.3, 0, 1) * 0.4;
       const obScore = clamp(
         obm.bestBidShare >= 0.6 &&
-          obm.imbalance >= CFG.strat.MIN_IMB &&
-          obm.spreadTicks <= CFG.strat.MAX_SPREAD_TICKS
+          obm.imbalance >= dynMinImb &&
+          obm.spreadTicks <= dynSpreadTicks
           ? 1
-          : 0.2 + 0.6 * clamp((obm.imbalance - 0.1) / 0.4, 0, 1),
+          : 0.2 + 0.6 * clamp((obm.imbalance - dynMinImb + 0.05) / 0.4, 0, 1),
         0,
         1
       );
@@ -152,10 +174,10 @@ async function main() {
         ob: obScore,
         candle: candleScore,
       });
-      const rvolPass = rvol >= CFG.strat.MIN_RVOL;
-      const spreadPass = obm.spreadTicks <= CFG.strat.MAX_SPREAD_TICKS;
+      const rvolPass = rvol >= dynRvolMin;
+      const spreadPass = obm.spreadTicks <= dynSpreadTicks;
       const gatingPass = band.pass && rvolPass && spreadPass;
-      const dec = shouldEnter(gatingPass ? probRaw : 0);
+      const dec = shouldEnter(gatingPass ? probRaw : 0, winBias.pRequired);
 
       const trendGate =
         trendPass && (!CFG.strat.REQUIRE_VWAP_ABOVE || aboveVWAP);
@@ -165,7 +187,7 @@ async function main() {
       const momentumProb = Math.min(0.98, dec.pStar + 0.02);
       const momentumStrong =
         obScore >= 0.9 &&
-        rvol >= CFG.strat.MIN_RVOL + 0.3 &&
+        rvol >= dynRvolMin + 0.3 &&
         atrTightPass &&
         (rsiStrong || fastMomentum) &&
         risingAcceleration &&
@@ -249,8 +271,19 @@ async function main() {
           imbalance: obm.imbalance,
           bestBidShare: obm.bestBidShare,
           aboveVWAP,
-          timeoutSec: CFG.strat.TIMEOUT_SEC,
-          stallSec: CFG.strat.STALL_SEC,
+          timeoutSec: winBias.timeoutSec ?? CFG.strat.TIMEOUT_SEC,
+          stallSec: winBias.stallSec ?? CFG.strat.STALL_SEC,
+          targets: {
+            tpPct: winBias.tpPct,
+            slPct: winBias.slPct,
+            stallSec: winBias.stallSec,
+            timeoutSec: winBias.timeoutSec,
+            minRvol: dynRvolMin,
+            maxSpreadTicks: dynSpreadTicks,
+            minImb: dynMinImb,
+            pRequired: winBias.pRequired,
+          },
+          winBias,
           price: last,
         };
         const entryRes = await exe.enterLong({
@@ -305,17 +338,17 @@ async function main() {
       }
       if (!rvolPass)
         deficits.push(
-          `거래량 부족: 현재 ${rvol.toFixed(
+          `거래량 부족: 현재 ${rvol.toFixed(2)}x → 최소 ${dynRvolMin.toFixed(
             2
-          )}x → 최소 ${CFG.strat.MIN_RVOL.toFixed(2)}x (＋${(
-            CFG.strat.MIN_RVOL - rvol
-          ).toFixed(2)}x)`
+          )}x (＋${(dynRvolMin - rvol).toFixed(2)}x)`
         );
       if (!spreadPass)
         deficits.push(
-          `스프레드 과대: 현재 ${obm.spreadTicks}틱 → 최대 ${
-            CFG.strat.MAX_SPREAD_TICKS
-          }틱 (－${obm.spreadTicks - CFG.strat.MAX_SPREAD_TICKS}틱)`
+          `스프레드 과대: 현재 ${
+            obm.spreadTicks
+          }틱 → 최대 ${dynSpreadTicks}틱 (－${
+            obm.spreadTicks - dynSpreadTicks
+          }틱)`
         );
       if (gatingPass && !probPass) {
         const targetProb = trendGate ? requiredProb : probBuffer;
@@ -332,9 +365,9 @@ async function main() {
           deficits.push(
             `추세 필터 미충족: 모멘텀 예외 조건(ATR ≥ ${(
               atrTightMin * 100
-            ).toFixed(2)}bp, OB ≥ 0.90, RVOL ≥ ${(
-              CFG.strat.MIN_RVOL + 0.3
-            ).toFixed(2)}x, RSI ≥ 60, 가속도 양호)을 만족하지 못함`
+            ).toFixed(2)}bp, OB ≥ 0.90, RVOL ≥ ${(dynRvolMin + 0.3).toFixed(
+              2
+            )}x, RSI ≥ 60, 가속도 양호)을 만족하지 못함`
           );
         if (!atrTightPass && !trendGate)
           deficits.push(
@@ -415,6 +448,8 @@ async function main() {
         market: CFG.run.market,
         mode: CFG.run.paper ? "PAPER" : "LIVE",
         price: last,
+        dynamicTargets:
+          exe.position?.context?.targets ?? winBias ?? lastWinBias,
 
         // Trend/VWAP
         trend: {
@@ -433,7 +468,7 @@ async function main() {
         atrHi: band.hi,
         atrPass: band.pass,
         rvol,
-        rvolMin: CFG.strat.MIN_RVOL,
+        rvolMin: dynRvolMin,
         obm,
         scores: {
           rsi: rsiScore,
@@ -459,7 +494,10 @@ async function main() {
         position: exe.position,
         unrealized,
         aliveSec,
-        timeoutSec: CFG.strat.TIMEOUT_SEC,
+        timeoutSec:
+          exe.position?.timeoutSec ??
+          winBias.timeoutSec ??
+          CFG.strat.TIMEOUT_SEC,
 
         // 체결/통계/부족치
         lastTrades,
@@ -496,7 +534,7 @@ async function main() {
         atrHi: NaN,
         atrPass: false,
         rvol: 0,
-        rvolMin: CFG.strat.MIN_RVOL,
+        rvolMin: lastWinBias?.minRvol ?? CFG.strat.MIN_RVOL,
         obm: { imbalance: 0, spreadTicks: 0, bid1: 0, ask1: 0 },
         scores: { rsi: 0, vol: 0, ob: 0, candle: 0 },
         p: 0,
@@ -506,7 +544,11 @@ async function main() {
         position: null,
         unrealized: { pnlKRW: 0, pnlPct: 0 },
         aliveSec: 0,
-        timeoutSec: CFG.strat.TIMEOUT_SEC,
+        dynamicTargets: exe.position?.context?.targets ?? lastWinBias,
+        timeoutSec:
+          exe.position?.timeoutSec ??
+          lastWinBias?.timeoutSec ??
+          CFG.strat.TIMEOUT_SEC,
         lastTrades: [],
         stats: { wins: 0, losses: 0, winrate: 0, pnl: 0, trades: 0 },
         deficits: [`루프 오류: ${e?.message}`],

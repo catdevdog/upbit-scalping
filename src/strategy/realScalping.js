@@ -12,8 +12,10 @@ export function buildSignal({ rsi, vol, ob, candle }) {
   return clamp(logistic(z), 0, 1);
 }
 
-export function shouldEnter(p) {
-  // Use derived p* from config (global single source)
-  const th = DERIVED?.pRequired ?? 0;
+export function shouldEnter(p, pRequiredOverride) {
+  // Allow dynamic p* overrides from optimizer (default to global derived value)
+  const th = Number.isFinite(pRequiredOverride)
+    ? pRequiredOverride
+    : DERIVED?.pRequired ?? 0;
   return { pass: nz(p) >= th, pStar: th };
 }
