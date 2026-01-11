@@ -1,9 +1,14 @@
+// src/executor/executor.js
+// 주문 실행 + 포지션 관리 + 부분 익절
+
+import * as fs from "node:fs";
 import { tickSizeFromOrderbook, roundToTick } from "../util/tick.js";
 import { CFG } from "../config/index.js";
 import * as Upbit from "../api/upbitAdapter.js";
 import { appendTrade } from "../monitor/tradeLog.js";
 import { appendOrderEvent } from "../monitor/orderEvents.js";
 import { nowKSTString } from "../util/math.js";
+import { PartialTakeProfitManager } from "./partialTakeProfit.js";
 
 const trimVolumeNumber = (value) => {
   const num = Number(value);
@@ -50,6 +55,10 @@ export class Executor {
     this.baseHoldings = null;
     this.pendingEntry = false;
     this._positionSeq = 0;
+
+    // 부분 익절 매니저 추가
+    this.partialMgr = new PartialTakeProfitManager();
+    this.pendingPartialTake = null;
   }
 
   CANCEL_REPLACE_MS = 1000;
@@ -58,8 +67,6 @@ export class Executor {
   paperMode() {
     return CFG.run.paper || !Upbit.hasKeys();
   }
-
-  sync() {}
 
   _pushOrderLog(evt) {
     if (!evt) return;
@@ -124,10 +131,20 @@ export class Executor {
 
     try {
       const accounts = await Upbit.getAccounts();
+
+      // 로그 파일에 기록
+      // const logPath = "./logs/balance.log";
+      // const timestamp = new Date().toISOString();
+      // fs.appendFileSync(logPath, `\n[${timestamp}] 계좌 조회 성공\n`);
+      // fs.appendFileSync(logPath, JSON.stringify(accounts, null, 2) + "\n");
+
       const krwAcc = accounts?.find?.((a) => a.currency === "KRW");
       if (krwAcc) {
         const balance = Number(krwAcc.balance) || 0;
         const locked = Number(krwAcc.locked) || 0;
+
+        // fs.appendFileSync(logPath, `KRW: ${balance} (잠금: ${locked})\n`);
+
         if (Number.isFinite(balance)) this.krw = Math.max(0, balance);
         this.accountInfo = {
           balance,
@@ -135,6 +152,8 @@ export class Executor {
           available: this.krw,
           unit: "KRW",
         };
+      } else {
+        // fs.appendFileSync(logPath, "ERROR: KRW 계좌 없음\n");
       }
 
       const baseCurrency = market?.split?.("-")?.[1];
@@ -147,6 +166,11 @@ export class Executor {
         this.baseHoldings = null;
       }
     } catch (e) {
+      console.error("\n❌❌❌ 계좌 조회 실패! ❌❌❌");
+      console.error("에러:", e?.message || e);
+      console.error("상세:", e);
+      console.error("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
       this._pushOrderLog({
         type: "balance_sync_error",
         err: String(e?.message ?? e),
@@ -527,18 +551,6 @@ export class Executor {
     const tsEpoch = Date.now();
     const tsISO = new Date(tsEpoch).toISOString();
     const ctx = context ? { ...context } : undefined;
-    const targetTPPct = Number.isFinite(ctx?.targets?.tpPct)
-      ? ctx.targets.tpPct
-      : CFG.strat.TP;
-    const targetSLPct = Number.isFinite(ctx?.targets?.slPct)
-      ? ctx.targets.slPct
-      : CFG.strat.SL;
-    const targetTimeout = Number.isFinite(ctx?.targets?.timeoutSec)
-      ? ctx.targets.timeoutSec
-      : CFG.strat.TIMEOUT_SEC;
-    const targetStall = Number.isFinite(ctx?.targets?.stallSec)
-      ? ctx.targets.stallSec
-      : CFG.strat.STALL_SEC;
     const positionId = ++this._positionSeq;
     const atrPctRaw = Number(ctx?.atrPct);
     const atrFrac =
@@ -549,13 +561,6 @@ export class Executor {
       Number.isFinite(atrFrac) ? atrFrac * 0.6 : 0,
       CFG.strat.BE_OFFSET
     );
-    const atrStallFloor = Number.isFinite(atrFrac)
-      ? Math.min(atrFrac * 0.35, 0.0005)
-      : 0;
-    const stallFloorPct = Math.min(
-      beFloorPct,
-      Math.max(atrStallFloor, feeBase * 0.35, 0.00025)
-    );
     const breakEvenPrice = entry * (1 + beFloorPct);
 
     this.position = {
@@ -564,8 +569,8 @@ export class Executor {
       entry,
       sizeKRW: spend,
       size: cleanSize,
-      tp: entry * (1 + targetTPPct),
-      sl: entry * (1 - targetSLPct),
+      tp: entry * (1 + CFG.strat.TP),
+      sl: entry * (1 - CFG.strat.SL),
       entryTs: tsEpoch,
       movedToBE: false,
       trailHigh: entry,
@@ -573,10 +578,6 @@ export class Executor {
       context: ctx,
       breakEvenPrice,
       beFloorPct,
-      stallFloorPct,
-      stallGraceUsed: false,
-      timeoutSec: targetTimeout,
-      stallSec: targetStall,
     };
 
     this._updateBaseHoldings(market, cleanSize, 0);
@@ -598,8 +599,6 @@ export class Executor {
       positionId,
     };
     if (Number.isFinite(beFloorPct)) entryEvent.beFloorPct = beFloorPct;
-    if (Number.isFinite(stallFloorPct))
-      entryEvent.stallFloorPct = stallFloorPct;
     if (ctx) entryEvent.ctx = ctx;
     appendTrade(entryEvent);
   }
@@ -689,6 +688,204 @@ export class Executor {
     return false;
   }
 
+  updateStops(last) {
+    if (!this.position || this.position.side !== "LONG") return;
+    const p = this.position;
+    const feeFloorPct = Math.max(
+      CFG.strat.FEE * 2 + CFG.strat.SLIP,
+      CFG.strat.BE_OFFSET
+    );
+    const beTriggerPct = Math.max(CFG.strat.BE_TRIGGER, feeFloorPct + 0.0002);
+    p.beFloorPct = feeFloorPct;
+    p.breakEvenPrice = p.entry * (1 + feeFloorPct);
+
+    p.trailHigh = Math.max(p.trailHigh ?? p.entry, last);
+    if (!p.movedToBE && last >= p.entry * (1 + beTriggerPct)) {
+      p.sl = Math.max(p.sl, p.breakEvenPrice);
+      p.movedToBE = true;
+    }
+
+    const trailStop = p.trailHigh * (1 - CFG.strat.TRAIL_PCT);
+    if (p.movedToBE) {
+      p.sl = Math.max(p.sl, trailStop, p.breakEvenPrice);
+    } else {
+      p.sl = Math.max(p.sl, trailStop);
+    }
+
+    // 부분 익절 체크 (신규)
+    const partial = this.partialMgr.checkPartialTake(this.position, last);
+    if (partial) {
+      this.pendingPartialTake = partial;
+    }
+  }
+
+  async maybeExitByPrice(last, market = CFG.run.market) {
+    if (!this.position) return null;
+
+    // 부분 익절 우선 처리 (신규)
+    if (this.pendingPartialTake) {
+      const partial = this.pendingPartialTake;
+      this.pendingPartialTake = null;
+
+      console.log(`💰 ${partial.message}`);
+
+      if (!this.paperMode()) {
+        const res = await Upbit.placeMarketSell({
+          market,
+          volume: partial.size,
+        });
+
+        appendTrade({
+          type: "PARTIAL_EXIT",
+          ts: nowKSTString(),
+          tsISO: new Date().toISOString(),
+          tsEpoch: Date.now(),
+          market,
+          side: "LONG",
+          reason: "PARTIAL_TAKE",
+          exit: partial.price,
+          entry: this.position.entry,
+          size: partial.size,
+          pnlKRW: (partial.price - this.position.entry) * partial.size,
+        });
+      }
+
+      // 포지션 업데이트
+      this.position = this.partialMgr.updateAfterPartial(
+        this.position,
+        partial
+      );
+      return null; // 아직 전체 청산 아님
+    }
+
+    const { size, tp, sl } = this.position;
+
+    const executeLiveExit = async (reason) => {
+      const res = await Upbit.placeMarketSell({ market, volume: size });
+      let notional = 0;
+      let vol = 0;
+      for (const t of res.trades || []) {
+        const v = Number(t?.volume ?? t?.trade_volume) || 0;
+        const pr = Number(t?.price ?? t?.trade_price) || 0;
+        notional += v * pr;
+        vol += v;
+      }
+      const exitPrice = vol > 0 ? notional / vol : last;
+      const realizedKRW = vol > 0 ? notional : exitPrice * size;
+      return this.finalizeExit({
+        reason,
+        exitPrice,
+        realizedKRW,
+        orderId: res?.uuid,
+        market,
+      });
+    };
+
+    if (last >= tp) {
+      if (this.paperMode()) {
+        return this.finalizeExit({
+          reason: "TP",
+          exitPrice: tp,
+          realizedKRW: size * tp,
+          market,
+        });
+      }
+      return executeLiveExit("TP");
+    }
+
+    if (last <= sl) {
+      if (this.paperMode()) {
+        return this.finalizeExit({
+          reason: "SL",
+          exitPrice: sl,
+          realizedKRW: size * sl,
+          market,
+        });
+      }
+      return executeLiveExit("SL");
+    }
+
+    return null;
+  }
+
+  maybeExitByTime(nowTs, last, market = CFG.run.market) {
+    if (!this.position) return null;
+    const { size, entryTs, movedToBE, entry } = this.position;
+    const alive = (nowTs - entryTs) / 1000;
+    const stallSec = CFG.strat.STALL_SEC;
+    const feeFloorPct = Math.max(
+      CFG.strat.BE_OFFSET,
+      CFG.strat.FEE + CFG.strat.SLIP
+    );
+    const bePrice = this.position.entry * (1 + feeFloorPct);
+
+    if (
+      Number.isFinite(stallSec) &&
+      stallSec > 0 &&
+      alive >= stallSec &&
+      !movedToBE &&
+      Number.isFinite(bePrice) &&
+      last < bePrice
+    ) {
+      if (this.paperMode()) {
+        return this.finalizeExit({
+          reason: "STALL",
+          exitPrice: last,
+          realizedKRW: size * last,
+          market,
+        });
+      }
+      return this.forceExit(last, "STALL", market);
+    }
+
+    const timeoutSec = CFG.strat.TIMEOUT_SEC;
+    if (alive >= timeoutSec) {
+      if (this.paperMode()) {
+        return this.finalizeExit({
+          reason: "TIMEOUT",
+          exitPrice: last,
+          realizedKRW: size * last,
+          market,
+        });
+      }
+      return this.forceExit(last, "TIMEOUT", market);
+    }
+    return null;
+  }
+
+  forceExit(last, reason = "FORCE", market = CFG.run.market) {
+    if (!this.position) return null;
+    const { size } = this.position;
+    if (this.paperMode()) {
+      return this.finalizeExit({
+        reason,
+        exitPrice: last,
+        realizedKRW: size * last,
+        market,
+      });
+    }
+
+    return Upbit.placeMarketSell({ market, volume: size }).then((res) => {
+      let notional = 0;
+      let vol = 0;
+      for (const t of res.trades || []) {
+        const v = Number(t?.volume ?? t?.trade_volume) || 0;
+        const pr = Number(t?.price ?? t?.trade_price) || 0;
+        notional += v * pr;
+        vol += v;
+      }
+      const exitPrice = vol > 0 ? notional / vol : last;
+      const realizedKRW = vol > 0 ? notional : exitPrice * size;
+      return this.finalizeExit({
+        reason,
+        exitPrice,
+        realizedKRW,
+        orderId: res?.uuid,
+        market,
+      });
+    });
+  }
+
   finalizeExit({
     reason,
     exitPrice,
@@ -708,8 +905,6 @@ export class Executor {
       context,
       breakEvenPrice,
       beFloorPct,
-      stallFloorPct,
-      stallGraceUsed,
     } = this.position;
     const safeExitPrice = Number.isFinite(exitPrice) ? exitPrice : entry;
     const exitNotionalRaw = size * safeExitPrice;
@@ -766,184 +961,23 @@ export class Executor {
       exitNotionalKRW: exitNotional,
       breakEvenPrice,
       beFloorPct,
-      stallFloorPct,
-      stallGraceUsed,
     };
+
+    // 부분 익절 정보 포함 (신규)
+    if (this.position.partialTakePrice) {
+      exitEvent.partialTakePrice = this.position.partialTakePrice;
+      exitEvent.partialTakeSize = this.position.partialTakeSize;
+      exitEvent.partialTakePnL = this.position.partialTakePnL;
+    }
+
     if (entryCtx) exitEvent.entryCtx = entryCtx;
     appendTrade(exitEvent);
+
+    // 부분 익절 매니저 리셋 (신규)
+    this.partialMgr.reset();
     this.position = null;
     this._updateBaseHoldings(market, 0, 0);
     return { reason, retKRW: net, feesKRW: totalFees };
-  }
-
-  updateStops(last) {
-    if (!this.position || this.position.side !== "LONG") return;
-    const p = this.position;
-    const feeFloorPct = Math.max(
-      CFG.strat.FEE * 2 + CFG.strat.SLIP,
-      CFG.strat.BE_OFFSET
-    );
-    const beTriggerPct = Math.max(CFG.strat.BE_TRIGGER, feeFloorPct + 0.0002);
-    p.beFloorPct = feeFloorPct;
-    p.breakEvenPrice = p.entry * (1 + feeFloorPct);
-
-    p.trailHigh = Math.max(p.trailHigh ?? p.entry, last);
-    if (!p.movedToBE && last >= p.entry * (1 + beTriggerPct)) {
-      p.sl = Math.max(p.sl, p.breakEvenPrice);
-      p.movedToBE = true;
-    }
-
-    const trailStop = p.trailHigh * (1 - CFG.strat.TRAIL_PCT);
-    if (p.movedToBE) {
-      p.sl = Math.max(p.sl, trailStop, p.breakEvenPrice);
-    } else {
-      p.sl = Math.max(p.sl, trailStop);
-    }
-  }
-
-  async maybeExitByPrice(last, market = CFG.run.market) {
-    if (!this.position) return null;
-    const { size, tp, sl } = this.position;
-
-    const executeLiveExit = async (reason) => {
-      const res = await Upbit.placeMarketSell({ market, volume: size });
-      let notional = 0;
-      let vol = 0;
-      for (const t of res.trades || []) {
-        const v = Number(t?.volume ?? t?.trade_volume) || 0;
-        const pr = Number(t?.price ?? t?.trade_price) || 0;
-        notional += v * pr;
-        vol += v;
-      }
-      const exitPrice = vol > 0 ? notional / vol : last;
-      const realizedKRW = vol > 0 ? notional : exitPrice * size;
-      return this.finalizeExit({
-        reason,
-        exitPrice,
-        realizedKRW,
-        orderId: res?.uuid,
-        market,
-      });
-    };
-
-    if (last >= tp) {
-      if (this.paperMode()) {
-        return this.finalizeExit({
-          reason: "TP",
-          exitPrice: tp,
-          realizedKRW: size * tp,
-          market,
-        });
-      }
-      return executeLiveExit("TP");
-    }
-
-    if (last <= sl) {
-      if (this.paperMode()) {
-        return this.finalizeExit({
-          reason: "SL",
-          exitPrice: sl,
-          realizedKRW: size * sl,
-          market,
-        });
-      }
-      return executeLiveExit("SL");
-    }
-
-    return null;
-  }
-
-  maybeExitByTime(nowTs, last, market = CFG.run.market) {
-    if (!this.position) return null;
-    const { size, entryTs, movedToBE, entry, stallGraceUsed } = this.position;
-    const alive = (nowTs - entryTs) / 1000;
-    const stallSec = Number.isFinite(this.position.stallSec)
-      ? this.position.stallSec
-      : CFG.strat.STALL_SEC;
-    const feeFloorPct = Math.max(
-      CFG.strat.BE_OFFSET,
-      CFG.strat.FEE + CFG.strat.SLIP
-    );
-    const bePriceDefault = this.position.entry * (1 + feeFloorPct);
-    const bePrice = Number.isFinite(this.position.breakEvenPrice)
-      ? this.position.breakEvenPrice
-      : bePriceDefault;
-    const stallFloorPct = Number.isFinite(this.position.stallFloorPct)
-      ? this.position.stallFloorPct
-      : Math.max(feeFloorPct * 0.6, CFG.strat.BE_OFFSET);
-    const stallPrice = this.position.entry * (1 + stallFloorPct);
-
-    if (
-      Number.isFinite(stallSec) &&
-      stallSec > 0 &&
-      alive >= stallSec &&
-      !movedToBE &&
-      Number.isFinite(stallPrice) &&
-      last < stallPrice
-    ) {
-      if (!stallGraceUsed && Number.isFinite(entry) && last >= entry) {
-        this.position.stallGraceUsed = true;
-        return null;
-      }
-      if (this.paperMode()) {
-        return this.finalizeExit({
-          reason: "STALL",
-          exitPrice: last,
-          realizedKRW: size * last,
-          market,
-        });
-      }
-      return this.forceExit(last, "STALL", market);
-    }
-
-    const timeoutSec = Number.isFinite(this.position.timeoutSec)
-      ? this.position.timeoutSec
-      : CFG.strat.TIMEOUT_SEC;
-    if (alive >= timeoutSec) {
-      if (this.paperMode()) {
-        return this.finalizeExit({
-          reason: "TIMEOUT",
-          exitPrice: last,
-          realizedKRW: size * last,
-          market,
-        });
-      }
-      return this.forceExit(last, "TIMEOUT", market);
-    }
-    return null;
-  }
-
-  forceExit(last, reason = "FORCE", market = CFG.run.market) {
-    if (!this.position) return null;
-    const { size } = this.position;
-    if (this.paperMode()) {
-      return this.finalizeExit({
-        reason,
-        exitPrice: last,
-        realizedKRW: size * last,
-        market,
-      });
-    }
-
-    return Upbit.placeMarketSell({ market, volume: size }).then((res) => {
-      let notional = 0;
-      let vol = 0;
-      for (const t of res.trades || []) {
-        const v = Number(t?.volume ?? t?.trade_volume) || 0;
-        const pr = Number(t?.price ?? t?.trade_price) || 0;
-        notional += v * pr;
-        vol += v;
-      }
-      const exitPrice = vol > 0 ? notional / vol : last;
-      const realizedKRW = vol > 0 ? notional : exitPrice * size;
-      return this.finalizeExit({
-        reason,
-        exitPrice,
-        realizedKRW,
-        orderId: res?.uuid,
-        market,
-      });
-    });
   }
 }
 

@@ -1,19 +1,21 @@
 {
   "name": "upbit-auto-trader",
-  "version": "1.0.0",
-  "description": "Upbit Automated Trading Bot with Adaptive Strategy",
+  "version": "4.0.0",
+  "description": "Upbit High Win-Rate Trading Bot",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
     "start": "dotenv -e .env -- node src/index.js",
-    "analyze:timeouts": "dotenv -e .env -- node scripts/analyze-timeouts.js"
+    "analyze:timeouts": "dotenv -e .env -- node scripts/analyze-timeouts.js",
+    "analyze:winrate": "dotenv -e .env -- node scripts/analyze-win-rate.js",
+    "clean-logs": "node scripts/clean-logs.js"
   },
   "keywords": [
     "upbit",
     "crypto",
     "trading",
     "bot",
-    "scalping"
+    "high-winrate"
   ],
   "author": "",
   "license": "MIT",
