@@ -394,7 +394,13 @@ export function checkDailyLimits(todayTrades) {
     (sum, t) => sum + Number(t.pnlKRW || 0),
     0
   );
-  const totalPnLPct = totalPnL / 5000000; // 초기 자본 가정 (추후 동적으로)
+
+  // ✅ 개선: 고정 초기자본 가정 대신 현재 총자산(equity) 기반으로 계산
+  // equity가 전달되지 않거나 비정상이면 기존 5,000,000 KRW 가정으로 폴백
+  const equityKRW = arguments.length >= 2 ? Number(arguments[1]) : NaN;
+  const base =
+    Number.isFinite(equityKRW) && equityKRW > 0 ? equityKRW : 5000000;
+  const totalPnLPct = totalPnL / base;
 
   if (totalPnLPct <= -dailyLossLimit) {
     return {

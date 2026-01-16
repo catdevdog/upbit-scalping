@@ -15,7 +15,8 @@ export function appendOrderEvent(evt) {
   try {
     ensureDir();
     const record = Object.assign({ ts: nowKSTString() }, evt);
-    fs.appendFileSync(file, JSON.stringify(record) + "\n");
+    // [Perf] 동기식 -> 비동기식 변경
+    fs.appendFile(file, JSON.stringify(record) + "\n", () => {});
   } catch (e) {
     // best-effort logging
     try {

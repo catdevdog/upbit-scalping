@@ -15,7 +15,10 @@ export function appendTrade(event) {
   try {
     ensureLogDir();
     const line = JSON.stringify(event) + "\n";
-    fs.appendFileSync(PATHS.tradeLog, line);
+    // [Perf] 동기식 I/O -> 비동기식으로 변경 (이벤트 루프 차단 방지)
+    fs.appendFile(PATHS.tradeLog, line, (err) => {
+      if (err) console.error("TradeLog append error:", err);
+    });
   } catch {}
 }
 

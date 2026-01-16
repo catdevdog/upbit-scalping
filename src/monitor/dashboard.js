@@ -86,18 +86,30 @@ export function renderDashboard(d) {
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // 헤더
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  const appVersion = process.env.APP_VERSION || "v3.1-Intraday";
+  const appTitle = process.env.APP_NAME || "업비트 수익매매 Bot";
   line("╔" + "═".repeat(78) + "╗");
-  line(`║ ${bold(cyan("⚡ 업비트 승률우선 Bot v4.0"))}${" ".repeat(50)}║`);
+  line(
+    `║ ${bold(cyan(`⚡ ${appTitle} ${appVersion}`))}${" ".repeat(
+      75 - appTitle.length - appVersion.length
+    )}║`
+  );
 
+  const effectiveMode =
+    d.account?.mode ?? d.mode ?? (CFG.run.paper ? "PAPER" : "LIVE");
+  const syncedAt = Number(d.account?.balanceSyncedAt ?? 0);
+  const syncAgeMs = syncedAt > 0 ? now - syncedAt : Number.POSITIVE_INFINITY;
   const apiStatus =
-    d.mode === "LIVE"
-      ? d.account?.balanceKRW > 0
-        ? green("LIVE-OK")
-        : red("LIVE-오류")
-      : yellow("PAPER");
+    effectiveMode === "PAPER"
+      ? yellow("PAPER")
+      : syncAgeMs <= 30_000
+      ? green("LIVE-OK")
+      : syncAgeMs <= 120_000
+      ? yellow("LIVE-지연")
+      : red("LIVE-오류");
   line(
     `║ ${dim(d.time)}  ${cyan(d.market)}  [${apiStatus}]${" ".repeat(
-      78 - 9 - d.time.length - d.market.length - 9
+      78 - 9 - d.time.length - d.market.length - 5
     )}║`
   );
   line("╚" + "═".repeat(78) + "╝");
@@ -180,7 +192,7 @@ export function renderDashboard(d) {
       "추세"
     )}  ${trendIcon} EMA ${emaFast} / ${emaSlow}   VWAP ${vwapVal} ${vwapIcon}${" ".repeat(
       73 -
-        25 -
+        26 -
         String(emaFast).length -
         String(emaSlow).length -
         String(vwapVal).length
@@ -193,7 +205,7 @@ export function renderDashboard(d) {
   line(
     `│ ${bold("ATR")}   ${atrIcon} ${atrVal}% ${bar(
       d.atrPct / 0.1,
-      15
+      17
     )}${" ".repeat(73 - 28 - atrVal.length)}│`
   );
 
@@ -203,7 +215,7 @@ export function renderDashboard(d) {
   line(
     `│ ${bold("RVOL")}  ${rvolIcon} ${rvolVal}x ${bar(
       d.rvol / 2.5,
-      15
+      17
     )}${" ".repeat(73 - 28 - rvolVal.length)}│`
   );
 
@@ -243,9 +255,9 @@ export function renderDashboard(d) {
     line(`${red("🚫 진입 차단:")} ${d.blockReason}`);
   }
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 성과
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // 성과 부분 수정 (거래 건수 표시 추가)
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   const stats = d.stats ?? {};
   const wins = stats.wins ?? 0;
   const losses = stats.losses ?? 0;
@@ -257,25 +269,29 @@ export function renderDashboard(d) {
   line("");
   line(bold("📈 성과"));
   line(`├─ 총 거래: ${totalTrades}건  승: ${green(wins)}  패: ${red(losses)}`);
-  line(`├─ 승률: ${wrColor(wr.toFixed(1) + "%")}  (목표: ${green("75%+")})`);
+  line(`├─ 승률: ${wrColor(wr.toFixed(1) + "%")}  (목표: ${green("65%+")})`);
   line(`└─ 누적: ${fmtPnl(totalPnl)} KRW`);
 
-  // 오늘 성과
+  // ✅ 오늘 성과 + 거래 건수 진행률
   if (d.daily) {
     const dWins = d.daily.wins ?? 0;
     const dLosses = d.daily.losses ?? 0;
     const dTrades = d.daily.trades ?? 0;
     const dPnl = d.daily.pnl ?? 0;
-    const targetMin = CFG.run.targetTradesMin;
-    const targetMax = CFG.run.targetTradesMax;
+    const targetMin = d.targetTradesMin ?? 10;
+    const targetMax = d.targetTradesMax ?? 15;
+    const todayCount = d.todayTradeCount ?? 0;
+
+    // 진행률 표시
+    const progress = Math.min(100, (todayCount / targetMax) * 100);
+    const progressBar = bar(progress / 100, 20);
 
     line(
       `   ${cyan(
         "오늘:"
-      )} ${dTrades}/${targetMin}-${targetMax}건  승${dWins} 패${dLosses}  ${fmtPnl(
-        dPnl
-      )} KRW`
+      )} ${todayCount}/${targetMin}-${targetMax}건 ${progressBar}`
     );
+    line(`   승${dWins} 패${dLosses}  ${fmtPnl(dPnl)} KRW`);
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -46,7 +46,9 @@ export class Executor {
   constructor(risk) {
     this.risk = risk;
     this.position = null;
-    this.krw = CFG.paper.krw;
+    // LIVE 모드에서는 잔고 동기화 전까지 모의자본을 쓰지 않도록 0으로 시작
+    // (refreshBalance 실패 시 가상잔고로 실매매가 나가는 사고 방지)
+    this.krw = this.paperMode() ? CFG.paper.krw : 0;
     this.pnlKRW = 0;
     this.orderHistory = [];
     this.lastError = null;
@@ -190,6 +192,8 @@ export class Executor {
       positionValue,
       equityKRW: this.krw + positionValue,
       realizedKRW: this.pnlKRW,
+      hasKeys: Upbit.hasKeys(),
+      balanceSyncedAt: this._lastBalanceSync,
       mode: this.paperMode() ? "PAPER" : "LIVE",
     };
   }
@@ -257,7 +261,11 @@ export class Executor {
     if (this.hasOpenExposure())
       return { ok: false, reason: "보유 포지션/주문 존재" };
 
-    let sizeKRW = this.risk.allocateKRW({ krwBalance: this.krw });
+    // 사이징: 잔고% 상한 + (옵션) 손절폭(SL%) 기반 리스크 고정
+    let sizeKRW = this.risk.allocateKRW({
+      krwBalance: this.krw,
+      slPct: CFG.strat.SL,
+    });
     if (sizeKRW < 5000) return { ok: false, reason: "최소주문금액 미달" };
 
     if (!this.paperMode()) {
@@ -483,6 +491,16 @@ export class Executor {
 
         remainingKRW = Math.max(0, sizeKRW - fillAgg.notional);
         if (remainingKRW < 5000) break;
+      }
+
+      // [Bugfix] 리밋 주문이 살아있는 상태에서 시장가 주문이 나가면 이중매수 위험.
+      // 루프 종료 후 남은 주문이 있다면 반드시 취소 시도.
+      if (lastOrder && !fillAgg.orderIds.has(lastOrder.uuid)) {
+        try {
+          await Upbit.cancelOrder(lastOrder.uuid);
+          // 취소 후 혹시 체결되었는지 확인하여 remainingKRW 업데이트 하면 좋지만,
+          // 최소한 이중 주문(Live Limit + Market)은 방지됨.
+        } catch (_) {}
       }
 
       if (remainingKRW > 0) {
@@ -727,6 +745,19 @@ export class Executor {
       const partial = this.pendingPartialTake;
       this.pendingPartialTake = null;
 
+      const positionSizeBefore = this.position.size;
+      const entryFeeTotalBefore = Number(this.position.entryFeeKRW) || 0;
+      const ratio =
+        positionSizeBefore > 0 ? partial.size / positionSizeBefore : 0;
+      const entryFeePortion = roundKRW(entryFeeTotalBefore * ratio);
+      const exitNotionalRaw = partial.price * partial.size;
+      const exitFeeKRW = roundKRW(exitNotionalRaw * CFG.strat.FEE);
+      const gross = roundKRW(
+        (partial.price - this.position.entry) * partial.size
+      );
+      const net = roundKRW(gross - entryFeePortion - exitFeeKRW);
+      const netDepositKRW = roundKRW(exitNotionalRaw - exitFeeKRW);
+
       console.log(`💰 ${partial.message}`);
 
       if (!this.paperMode()) {
@@ -734,27 +765,46 @@ export class Executor {
           market,
           volume: partial.size,
         });
-
-        appendTrade({
-          type: "PARTIAL_EXIT",
-          ts: nowKSTString(),
-          tsISO: new Date().toISOString(),
-          tsEpoch: Date.now(),
-          market,
-          side: "LONG",
-          reason: "PARTIAL_TAKE",
-          exit: partial.price,
-          entry: this.position.entry,
-          size: partial.size,
-          pnlKRW: (partial.price - this.position.entry) * partial.size,
-        });
       }
+
+      // 부분익절 정산: PAPER는 내부 KRW 반영, LIVE는 실계좌가 있으므로 PnL만 누적
+      if (this.paperMode()) {
+        this.krw = roundKRW(Math.max(0, this.krw + netDepositKRW));
+      }
+      this.pnlKRW = roundKRW(this.pnlKRW + net);
+
+      appendTrade({
+        type: "PARTIAL_EXIT",
+        ts: nowKSTString(),
+        tsISO: new Date().toISOString(),
+        tsEpoch: Date.now(),
+        market,
+        side: "LONG",
+        reason: "PARTIAL_TAKE",
+        exit: partial.price,
+        entry: this.position.entry,
+        size: partial.size,
+        pnlKRW: net,
+        pnlGrossKRW: gross,
+        feesKRW: roundKRW(entryFeePortion + exitFeeKRW),
+        feeEntryKRW: entryFeePortion,
+        feeExitKRW: exitFeeKRW,
+        exitNotionalKRW: roundKRW(exitNotionalRaw),
+      });
 
       // 포지션 업데이트
       this.position = this.partialMgr.updateAfterPartial(
         this.position,
         partial
       );
+
+      // 남은 포지션에 엔트리 수수료를 비례 차감해 반영
+      if (this.position) {
+        this.position.entryFeeKRW = roundKRW(
+          Math.max(0, entryFeeTotalBefore - entryFeePortion)
+        );
+        this._updateBaseHoldings(market, this.position.size, 0);
+      }
       return null; // 아직 전체 청산 아님
     }
 

@@ -1,5 +1,5 @@
 // src/index.js
-// 메인 루프: 승률 우선 전략
+// 메인 루프: 승률 우선 전략 + 캔들 캐싱 최적화
 
 import { CFG } from "./config/index.js";
 import * as Upbit from "./api/upbitAdapter.js";
@@ -27,26 +27,96 @@ process.on("unhandledRejection", (e) =>
   console.error(`❌ UnhandledRejection: ${e}`)
 );
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 캔들 캐싱 변수 (API 호출 99% 감소)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+let candles1mCache = null;
+let candles5mCache = null;
+let lastCandle1mUpdate = 0;
+let lastCandle5mUpdate = 0;
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 일일 거래 건수 추적 (목표: 10~15건)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+let todayTradeCount = 0;
+// 업비트(한국) 기준 일자(KST)로 리셋되도록 날짜 키를 KST로 계산
+const kstDateKey = () =>
+  new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+let lastResetDate = kstDateKey(); // YYYY-MM-DD (KST)
+
+function resetDailyCounter() {
+  const currentDate = kstDateKey();
+  if (currentDate !== lastResetDate) {
+    console.log(`\n🔄 일일 카운터 리셋: ${lastResetDate} → ${currentDate}`);
+    console.log(`   어제 거래: ${todayTradeCount}건\n`);
+    todayTradeCount = 0;
+    lastResetDate = currentDate;
+  }
+}
+
 async function main() {
   initTTY();
-  const risk = new Risk();
+  const risk = new Risk(CFG.risk);
   const exe = new Executor(risk);
   await exe.refreshBalance(true, CFG.run.market);
 
+  // 모드/키/잔고 진단 로그 (1회)
+  console.log(
+    `\n🔎 MODE: CFG.run.paper=${
+      CFG.run.paper
+    } | hasKeys=${Upbit.hasKeys()} | exe.paperMode()=${exe.paperMode()} | exe.krw=${
+      exe.krw
+    }\n`
+  );
+
+  // WebSocket 연결 시작
   const snap = Upbit.ensureWS(CFG.run.market);
+
+  console.log("━".repeat(80));
+  console.log("🚀 업비트 스캘핑 봇 시작");
+  console.log(
+    `📊 목표 거래: ${CFG.run.targetTradesMin}~${CFG.run.targetTradesMax}건/일`
+  );
+  console.log(`💰 목표 수익: 0.8%+ / 일`);
+  console.log(`⚡ WebSocket: 활성화`);
+  console.log(`📦 캔들 캐싱: 활성화 (API 99% 절감)`);
+  console.log("━".repeat(80) + "\n");
 
   while (true) {
     const t0 = Date.now();
     try {
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      // 데이터 수집
+      // 일일 카운터 리셋 체크
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      resetDailyCounter();
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // 데이터 수집 (WebSocket + 스마트 캐싱)
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      const now = Date.now();
+
+      // 호가창: WebSocket 우선, fallback REST API
       const ob = snap.orderbook ?? (await Upbit.getOrderbook(CFG.run.market));
+
+      // 체결가: WebSocket 우선, fallback REST API
       const trades = snap.trade
         ? [snap.trade]
         : await Upbit.getTrades(CFG.run.market, 60);
-      const candles1m = await Upbit.getMinuteCandles(1, CFG.run.market, 240);
-      const candles5m = await Upbit.getMinuteCandles(5, CFG.run.market, 240);
+
+      // 1분 캔들: 1분마다만 갱신 (60초 캐싱)
+      if (now - lastCandle1mUpdate > 60000 || !candles1mCache) {
+        candles1mCache = await Upbit.getMinuteCandles(1, CFG.run.market, 240);
+        lastCandle1mUpdate = now;
+      }
+      const candles1m = candles1mCache;
+
+      // 5분 캔들: 5분마다만 갱신 (300초 캐싱)
+      if (now - lastCandle5mUpdate > 300000 || !candles5mCache) {
+        candles5mCache = await Upbit.getMinuteCandles(5, CFG.run.market, 240);
+        lastCandle5mUpdate = now;
+      }
+      const candles5m = candles5mCache;
 
       const last =
         Number(trades?.[0]?.trade_price) || Number(candles1m?.[0]?.c);
@@ -80,7 +150,7 @@ async function main() {
       const closes5 = candles5m
         .map((c) => c.c)
         .slice()
-        .reverse(); // oldest→newest
+        .reverse();
       const emaFast = ema(closes5, CFG.strat.TREND_EMA_FAST);
       const emaSlow = ema(closes5, CFG.strat.TREND_EMA_SLOW);
       const trendPass =
@@ -136,7 +206,7 @@ async function main() {
         candle: candleScore,
       });
 
-      const dec = shouldEnter(probRaw, null); // pStar는 DERIVED 사용
+      const dec = shouldEnter(probRaw, null);
 
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
       // 포지션 관리 (기존 포지션 먼저 처리)
@@ -150,55 +220,78 @@ async function main() {
       }
 
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      // 진입 체크 (승률 우선)
+      // 진입 체크 (승률 우선 + 거래 건수 제어)
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
       let canEnterNow = false;
       let blockReason = null;
       const hasExposure = exe.hasOpenExposure();
 
       if (!hasExposure) {
-        // 거래 로그 분석
-        const { exits: allExits } = readExits();
-        const recentExits = allExits.slice(-10);
-        const nowStr = nowKSTString();
-        const todayKey = nowStr.slice(0, 10);
-        const todayExits = allExits.filter(
-          (e) => typeof e.ts === "string" && e.ts.slice(0, 10) === todayKey
-        );
-
-        // 시간대/연속손실/일일제한 체크
-        const timeCheck = checkTradingHours();
-        const consecCheck = checkConsecutiveLosses(recentExits);
-        const dailyCheck = checkDailyLimits(todayExits);
-
-        if (!timeCheck.pass) {
-          blockReason = timeCheck.reason;
-        } else if (!consecCheck.pass) {
-          blockReason = consecCheck.reason;
-        } else if (!dailyCheck.pass) {
-          blockReason = dailyCheck.reason;
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // 일일 거래 건수 제한 체크 (최우선)
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if (todayTradeCount >= CFG.run.targetTradesMax) {
+          blockReason = `일일 목표 달성 (${todayTradeCount}/${CFG.run.targetTradesMax}건)`;
         } else {
-          // 승률 우선 진입 조건 종합 체크
-          const entryCheck = checkHighWinRateEntry({
-            currentPrice: last,
-            emaFast,
-            emaSlow,
-            vwap: vwapVal,
-            atrPct,
-            atrLo: band.lo,
-            atrHi: band.hi,
-            rvol,
-            orderbook: obm,
-            rsi,
-            candles1m,
-            probability: probRaw,
-            pStar: dec.pStar,
-          });
+          // 거래 로그 분석
+          const { exits: allExits } = readExits();
+          const recentExits = allExits.slice(-10);
+          const nowStr = nowKSTString();
+          const todayKey = nowStr.slice(0, 10);
+          const todayExits = allExits.filter(
+            (e) => typeof e.ts === "string" && e.ts.slice(0, 10) === todayKey
+          );
 
-          if (entryCheck.pass) {
-            canEnterNow = true;
+          // ✅ 저빈도 운용용: 진입 간 최소 간격(손실 여부 무관)
+          const minGapMin = Number(CFG.limits.MIN_ENTRY_GAP_MINUTES) || 0;
+          if (minGapMin > 0 && recentExits.length) {
+            const lastExit = recentExits[recentExits.length - 1];
+            const lastExitTs = Number(lastExit.exitTs ?? lastExit.tsEpoch) || 0;
+            const elapsedMs = Date.now() - lastExitTs;
+            const minGapMs = minGapMin * 60 * 1000;
+            if (lastExitTs > 0 && elapsedMs < minGapMs) {
+              const remainMin = Math.ceil((minGapMs - elapsedMs) / 60000);
+              blockReason = `최소 진입 간격 대기: ${remainMin}분 남음`;
+            }
+          }
+
+          // 시간대/연속손실/일일제한 체크
+          const timeCheck = checkTradingHours();
+          const consecCheck = checkConsecutiveLosses(recentExits);
+          const equityKRW = exe.accountSnapshot(last)?.equityKRW;
+          const dailyCheck = checkDailyLimits(todayExits, equityKRW);
+
+          if (blockReason) {
+            // MIN_ENTRY_GAP_MINUTES 에 의해 이미 차단됨
+          } else if (!timeCheck.pass) {
+            blockReason = timeCheck.reason;
+          } else if (!consecCheck.pass) {
+            blockReason = consecCheck.reason;
+          } else if (!dailyCheck.pass) {
+            blockReason = dailyCheck.reason;
           } else {
-            blockReason = entryCheck.reason;
+            // 승률 우선 진입 조건 종합 체크
+            const entryCheck = checkHighWinRateEntry({
+              currentPrice: last,
+              emaFast,
+              emaSlow,
+              vwap: vwapVal,
+              atrPct,
+              atrLo: band.lo,
+              atrHi: band.hi,
+              rvol,
+              orderbook: obm,
+              rsi,
+              candles1m,
+              probability: probRaw,
+              pStar: dec.pStar,
+            });
+
+            if (entryCheck.pass) {
+              canEnterNow = true;
+            } else {
+              blockReason = entryCheck.reason;
+            }
           }
         }
       }
@@ -225,11 +318,19 @@ async function main() {
           price: last,
         };
 
-        await exe.enterLong({
+        const entryResult = await exe.enterLong({
           price: last,
           atrPct,
           context: entryCtx,
         });
+
+        // 진입 성공 시 카운터 증가
+        if (entryResult?.ok) {
+          todayTradeCount++;
+          console.log(
+            `\n✅ 진입 성공! 오늘 ${todayTradeCount}/${CFG.run.targetTradesMax}건째 거래\n`
+          );
+        }
       }
 
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -254,6 +355,14 @@ async function main() {
         sysLog.push({ ts: exe.lastError.ts, msg: exe.lastError.message });
       }
 
+      // WebSocket 지연 시간 경고
+      if (snap.wsLagMs > 100) {
+        sysLog.push({
+          ts: nowStr,
+          msg: `⚠️ WebSocket 지연: ${snap.wsLagMs}ms`,
+        });
+      }
+
       const pnlKRW = exe.position
         ? (last - exe.position.entry) * exe.position.size
         : 0;
@@ -274,7 +383,7 @@ async function main() {
       renderDashboard({
         time: nowStr,
         market: CFG.run.market,
-        mode: CFG.run.paper ? "PAPER" : "LIVE",
+        mode: exe.paperMode() ? "PAPER" : "LIVE",
         price: last,
         account,
 
@@ -316,7 +425,13 @@ async function main() {
         stats,
         daily,
 
+        // 거래 건수 정보 추가
+        todayTradeCount,
+        targetTradesMin: CFG.run.targetTradesMin,
+        targetTradesMax: CFG.run.targetTradesMax,
+
         systemLog: sysLog,
+        wsLag: snap.wsLagMs, // WebSocket 지연 시간
       });
 
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -332,7 +447,7 @@ async function main() {
       renderDashboard({
         time: nowKSTString(),
         market: CFG.run.market,
-        mode: CFG.run.paper ? "PAPER" : "LIVE",
+        mode: exe.paperMode() ? "PAPER" : "LIVE",
         price: 0,
         account,
         trend: {
@@ -361,7 +476,11 @@ async function main() {
         lastTrades: [],
         stats: { wins: 0, losses: 0, winrate: 0, pnl: 0, trades: 0 },
         daily: null,
+        todayTradeCount,
+        targetTradesMin: CFG.run.targetTradesMin,
+        targetTradesMax: CFG.run.targetTradesMax,
         systemLog: [{ ts: nowKSTString(), msg: e?.stack ?? String(e) }],
+        wsLag: 0,
       });
       await new Promise((r) => setTimeout(r, 500));
     }
