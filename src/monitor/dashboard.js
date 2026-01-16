@@ -75,6 +75,12 @@ function fmtPct(value) {
   return `${sign}${val.toFixed(2)}%`;
 }
 
+function padLine(content, width = 73) {
+  const plain = String(content).replace(/\x1b\[[0-9;]*m/g, "");
+  const spaces = Math.max(0, width - plain.length);
+  return `│ ${content}${" ".repeat(spaces)}│`;
+}
+
 export function renderDashboard(d) {
   const now = Date.now();
   if (now - __lastTs < CFG.ui.minRenderMs) return;
@@ -188,35 +194,29 @@ export function renderDashboard(d) {
   const vwapVal = d.trend?.vwap ? Math.round(d.trend.vwap) : "N/A";
   const vwapIcon = d.trend?.aboveVWAP ? green("↑") : red("↓");
   line(
-    `│ ${bold(
-      "추세"
-    )}  ${trendIcon} EMA ${emaFast} / ${emaSlow}   VWAP ${vwapVal} ${vwapIcon}${" ".repeat(
-      73 -
-        26 -
-        String(emaFast).length -
-        String(emaSlow).length -
-        String(vwapVal).length
-    )}│`
+    padLine(
+      `${bold(
+        "추세"
+      )} ${trendIcon} EMA ${emaFast}/${emaSlow} | VWAP ${vwapVal} ${vwapIcon}`
+    )
   );
 
   // ATR
   const atrVal = Number.isFinite(d.atrPct) ? d.atrPct.toFixed(3) : "N/A";
   const atrIcon = d.atrPass ? green("✓") : red("✗");
   line(
-    `│ ${bold("ATR")}   ${atrIcon} ${atrVal}% ${bar(
-      d.atrPct / 0.1,
-      17
-    )}${" ".repeat(73 - 28 - atrVal.length)}│`
+    padLine(
+      `${bold("변동성")} ${atrIcon} ATR ${atrVal}% ${bar(d.atrPct / 0.1, 17)}`
+    )
   );
 
   // RVOL
   const rvolVal = d.rvol?.toFixed(2) ?? "0.00";
   const rvolIcon = d.filters?.rvol ? green("✓") : red("✗");
   line(
-    `│ ${bold("RVOL")}  ${rvolIcon} ${rvolVal}x ${bar(
-      d.rvol / 2.5,
-      17
-    )}${" ".repeat(73 - 28 - rvolVal.length)}│`
+    padLine(
+      `${bold("거래량")} ${rvolIcon} RVOL ${rvolVal}x ${bar(d.rvol / 2.5, 17)}`
+    )
   );
 
   // 호가
@@ -224,15 +224,16 @@ export function renderDashboard(d) {
   const spreadVal = d.obm?.spreadTicks ?? 0;
   const obIcon = d.filters?.spread ? green("✓") : red("✗");
   line(
-    `│ ${bold(
-      "호가"
-    )}  ${obIcon} 불균형 ${imbVal}%  스프레드 ${spreadVal}틱${" ".repeat(
-      73 - 30 - imbVal.length - String(spreadVal).length
-    )}│`
+    padLine(`${bold("오더북")} ${obIcon} Imb ${imbVal}% | Spr ${spreadVal}틱`)
   );
 
   line(
     "└─────────────────────────────────────────────────────────────────────────┘"
+  );
+  line(
+    dim(
+      "용어: EMA=지수이평, VWAP=거래량가중평균, ATR=변동성, RVOL=상대거래량, Imb=불균형, Spr=스프레드"
+    )
   );
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -245,7 +246,11 @@ export function renderDashboard(d) {
     delta >= 0 ? green(`+${delta.toFixed(1)}%`) : red(`${delta.toFixed(1)}%`);
 
   line("");
-  line(`${bold("🎲 확률")}  p=${pVal}%  p*=${pStarVal}%  ${deltaStr}`);
+  line(
+    `${bold(
+      "🎲 확률"
+    )}  예측확률(p)=${pVal}%  임계확률(p*)=${pStarVal}%  차이(Δ) ${deltaStr}`
+  );
 
   if (d.modelPerf?.count) {
     const mp = d.modelPerf;
@@ -257,9 +262,13 @@ export function renderDashboard(d) {
       ? (mp.avgSizeScale * 100).toFixed(0)
       : "-";
     line(
-      `${bold("🤖 ML 성능")}  샘플 ${mp.count}  승률 ${wr}%  평균p ${avgP}%`
+      `${bold("🤖 ML 성능")}  샘플 ${
+        mp.count
+      }  승률 ${wr}%  평균확률(p) ${avgP}%`
     );
-    line(`   Brier ${brier}  LogLoss ${ll}  평균 비중 ${scale}%`);
+    line(
+      `   브라이어(Brier) ${brier}  로그손실(LogLoss) ${ll}  평균 비중(Size) ${scale}%`
+    );
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

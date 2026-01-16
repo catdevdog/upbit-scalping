@@ -1,7 +1,8 @@
 // src/index.js
 // 메인 루프: 승률 우선 전략 + 캔들 캐싱 최적화
 
-import { CFG } from "./config/index.js";
+import { CFG, DERIVED, PATHS } from "./config/index.js";
+import fs from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import * as Upbit from "./api/upbitAdapter.js";
@@ -18,7 +19,7 @@ import {
 import { Risk } from "./risk/riskManager.js";
 import { Executor } from "./executor/executor.js";
 import { renderDashboard, initTTY } from "./monitor/dashboard.js";
-import { readExits } from "./monitor/tradeLog.js";
+import { getTradeStats } from "./monitor/tradeLog.js";
 import {
   buildFeatureVector,
   buildFeatureVectorWithOrderbook,
@@ -39,6 +40,9 @@ let candles1mCache = null;
 let candles5mCache = null;
 let lastCandle1mUpdate = 0;
 let lastCandle5mUpdate = 0;
+let lastProbLogTs = 0;
+let lastProbLogP = NaN;
+let lastProbLogPStar = NaN;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 일일 거래 건수 추적 (목표: 10~15건)
@@ -62,6 +66,10 @@ function resetDailyCounter() {
 
 async function main() {
   initTTY();
+  const probLogPath = path.resolve(PATHS.logDir, "probability.jsonl");
+  try {
+    fs.mkdirSync(PATHS.logDir, { recursive: true });
+  } catch {}
   const risk = new Risk(CFG.risk);
   const exe = new Executor(risk);
   await exe.refreshBalance(true, CFG.run.market);
@@ -104,6 +112,44 @@ async function main() {
           "--days",
           String(backfillDays),
         ]);
+
+        // ✅ 워크포워드 검증 추가
+        console.log("\n📊 워크포워드 검증 시작...");
+        await runScript("scripts/walkforward-validate.js", ["--folds", "5"]);
+
+        // 검증 결과 확인
+        const wfResultPath = path.resolve(
+          process.cwd(),
+          "./logs/wf_results.json"
+        );
+        if (fs.existsSync(wfResultPath)) {
+          const wfResults = JSON.parse(fs.readFileSync(wfResultPath, "utf8"));
+          const avgWR = wfResults.avgWinrate ?? 0;
+          const avgSharpe = wfResults.avgSharpe ?? 0;
+          const pRequired = DERIVED.pRequired;
+
+          console.log(
+            `📊 워크포워드 결과: 승률 ${(avgWR * 100).toFixed(
+              1
+            )}%, Sharpe ${avgSharpe.toFixed(2)}`
+          );
+          console.log(
+            `   요구사항: 승률 ≥ ${(pRequired * 100).toFixed(1)}%, Sharpe ≥ 1.0`
+          );
+
+          if (avgWR < pRequired || avgSharpe < 1.0) {
+            console.error("❌ 워크포워드 실패 - 모델 업데이트 중단");
+            console.error(
+              `   현재: 승률 ${(avgWR * 100).toFixed(
+                1
+              )}%, Sharpe ${avgSharpe.toFixed(2)}`
+            );
+            return; // 모델 학습 스킵
+          }
+          console.log("✅ 워크포워드 검증 통과 - 모델 학습 진행");
+        }
+
+        // 검증 통과 시에만 모델 학습
         if (CFG.ml?.useOrderbookFeatures) {
           await runScript("scripts/train-ml-trades.js");
         } else if (CFG.ml?.regimeEnabled) {
@@ -277,13 +323,17 @@ async function main() {
           ? mlModelHigh
           : mlModelLow
         : mlModel;
-      const minProb = mlRegimeEnabled
+      const minProbFloor = mlRegimeEnabled
         ? Number(isHighVol ? CFG.ml.minProbHigh : CFG.ml.minProbLow)
         : Number(CFG.ml.minProb ?? 0.58);
 
       const mlProb =
         modelToUse && mlFeatures
-          ? predictProbability(modelToUse, mlFeatures.values)
+          ? predictProbability(
+              modelToUse,
+              mlFeatures.values,
+              mlFeatures.featureNames
+            )
           : NaN;
       const fee = Number(CFG.ml.fee ?? CFG.strat.FEE ?? 0);
       const slip = Number(CFG.ml.slip ?? CFG.strat.SLIP ?? 0);
@@ -304,10 +354,23 @@ async function main() {
           )
         : Number(CFG.strat.SL ?? 0);
 
-      const tpNet = tpPctDyn - fee - slip;
-      const slNet = slPctDyn + fee + slip;
+      // 왕복 비용 기준으로 p* 계산 일관성 유지
+      const roundTripCost = 2 * (fee + slip);
+      const tpNet = tpPctDyn - roundTripCost;
+      const slNet = slPctDyn + roundTripCost;
+      const pStarBase =
+        Number.isFinite(tpNet) &&
+        Number.isFinite(slNet) &&
+        tpNet > 0 &&
+        slNet > 0
+          ? clamp(slNet / Math.max(1e-9, tpNet + slNet), 0, 1)
+          : minProbFloor;
+      const pStarBuffer = Number(CFG.ml?.probBuffer ?? 0);
+      const pStar = CFG.ml?.dynamicPstar
+        ? Math.max(minProbFloor, pStarBase + pStarBuffer)
+        : minProbFloor;
       const probScale = Number.isFinite(mlProb)
-        ? clamp((mlProb - minProb) / Math.max(1e-9, 1 - minProb), 0, 1)
+        ? clamp((mlProb - pStar) / Math.max(1e-9, 1 - pStar), 0, 1)
         : 0;
       const ev = Number.isFinite(mlProb)
         ? mlProb * tpNet - (1 - mlProb) * slNet
@@ -323,9 +386,46 @@ async function main() {
       );
       const probRaw = mlProb;
       const dec = {
-        pass: Number.isFinite(mlProb) && mlProb >= minProb,
-        pStar: minProb,
+        pass: Number.isFinite(mlProb) && mlProb >= pStar,
+        pStar,
       };
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // 확률(p) 변화 기록 (저빈도)
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      if (Number.isFinite(mlProb)) {
+        const shouldLogProb =
+          !Number.isFinite(lastProbLogP) ||
+          !Number.isFinite(lastProbLogPStar) ||
+          now - lastProbLogTs >= 60000 ||
+          Math.abs(mlProb - lastProbLogP) >= 0.01 ||
+          Math.abs(dec.pStar - lastProbLogPStar) >= 0.01;
+
+        if (shouldLogProb) {
+          const probLog = {
+            ts: now,
+            tsISO: new Date(now).toISOString(),
+            market: CFG.run.market,
+            p: mlProb,
+            pStar: dec.pStar,
+            ev,
+            sizeScale,
+            tpPct: tpPctDyn,
+            slPct: slPctDyn,
+            atrPct,
+            rvol,
+            rsi,
+            emaRatio,
+            vwapDist,
+            wsLagMs: snap.wsLagMs,
+          };
+
+          fs.appendFile(probLogPath, JSON.stringify(probLog) + "\n", () => {});
+          lastProbLogTs = now;
+          lastProbLogP = mlProb;
+          lastProbLogPStar = dec.pStar;
+        }
+      }
 
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
       // 포지션 관리 (기존 포지션 먼저 처리)
@@ -336,6 +436,46 @@ async function main() {
         if (!exit1) {
           await exe.maybeExitByTime(Date.now(), last);
         }
+      }
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // 수집/수익 모드 결정
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      function determineMode({ stats, modelPerf, todayExits, equityKRW }) {
+        const recentWR = modelPerf?.winrate ?? 0.5;
+        const recentCount = modelPerf?.count ?? 0;
+        const pRequired = DERIVED.pRequired;
+
+        // 1. 최근 20거래 실승률 < p* → 수집 모드
+        if (recentCount >= 20 && recentWR < pRequired) {
+          return {
+            mode: "COLLECT",
+            reason: `실승률 ${(recentWR * 100).toFixed(1)}% < p* ${(
+              pRequired * 100
+            ).toFixed(1)}%`,
+          };
+        }
+
+        // 2. 오늘 2연패 이상 → 수집 모드
+        const lastTwo = todayExits.slice(-2);
+        if (lastTwo.length >= 2 && lastTwo.every((t) => Number(t.pnlKRW) < 0)) {
+          return { mode: "COLLECT", reason: "금일 2연패" };
+        }
+
+        // 3. 일일 손실 -2% 초과 → 수집 모드
+        const dailyPnL = todayExits.reduce(
+          (s, e) => s + Number(e.pnlKRW || 0),
+          0
+        );
+        const dailyPnLPct = dailyPnL / Math.max(1, equityKRW);
+        if (dailyPnLPct < -0.02) {
+          return {
+            mode: "COLLECT",
+            reason: `일일 손실 ${(dailyPnLPct * 100).toFixed(2)}%`,
+          };
+        }
+
+        return { mode: "PROFIT", reason: "정상 운용" };
       }
 
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -352,8 +492,8 @@ async function main() {
         if (todayTradeCount >= CFG.run.targetTradesMax) {
           blockReason = `일일 목표 달성 (${todayTradeCount}/${CFG.run.targetTradesMax}건)`;
         } else {
-          // 거래 로그 분석
-          const { exits: allExits } = readExits();
+          // 거래 로그 분석 (메모리 캐시 사용)
+          const { exits: allExits } = getTradeStats();
           const recentExits = allExits.slice(-10);
           const nowStr = nowKSTString();
           const todayKey = nowStr.slice(0, 10);
@@ -419,67 +559,11 @@ async function main() {
       }
 
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      // 진입 실행
+      // 성과 통계 계산 (모드 결정용)
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      if (canEnterNow) {
-        const entryCtx = {
-          atrPct,
-          atrLo: band.lo,
-          atrHi: band.hi,
-          rvol,
-          rsi,
-          ret1,
-          ret5,
-          emaRatio,
-          vwapDist,
-          prob: probRaw,
-          pStar: dec.pStar,
-          emaFast,
-          emaSlow,
-          vwap: vwapVal,
-          aboveVWAP,
-          imbalance: obm.imbalance,
-          spreadTicks: obm.spreadTicks,
-          bestBidShare: obm.bestBidShare,
-          tpPct: tpPctDyn,
-          slPct: slPctDyn,
-          price: last,
-        };
+      const { exits: allExitsForStats, stats } = getTradeStats();
 
-        const entryResult = await exe.enterLong({
-          price: last,
-          atrPct,
-          context: { ...entryCtx, sizeScale },
-          sizeScale,
-          slPctOverride: slPctDyn,
-        });
-
-        // 진입 성공 시 카운터 증가
-        if (entryResult?.ok) {
-          todayTradeCount++;
-          console.log(
-            `\n✅ 진입 성공! 오늘 ${todayTradeCount}/${CFG.run.targetTradesMax}건째 거래\n`
-          );
-        }
-      }
-
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      // 성과/로그
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      const { exits, stats } = readExits();
-      const nowStr = nowKSTString();
-      const todayKey = nowStr.slice(0, 10);
-      const todayExits = exits.filter(
-        (e) => typeof e.ts === "string" && e.ts.slice(0, 10) === todayKey
-      );
-      const daily = {
-        trades: todayExits.length,
-        wins: todayExits.filter((e) => Number(e.pnlKRW) > 0).length,
-        losses: todayExits.filter((e) => Number(e.pnlKRW) <= 0).length,
-        pnl: todayExits.reduce((s, e) => s + Number(e.pnlKRW || 0), 0),
-      };
-
-      const perfSamples = exits
+      const perfSamples = allExitsForStats
         .filter((e) => Number.isFinite(e?.entryCtx?.prob))
         .slice(-200);
       const perfCount = perfSamples.length;
@@ -510,7 +594,129 @@ async function main() {
           }
         : null;
 
-      const lastTrades = exits.slice(-10);
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // 진입 실행 (수집/수익 모드 분리)
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      const nowStr = nowKSTString();
+      const todayKey = nowStr.slice(0, 10);
+      const todayExitsForMode = allExitsForStats.filter(
+        (e) => typeof e.ts === "string" && e.ts.slice(0, 10) === todayKey
+      );
+
+      const modeInfo = determineMode({
+        stats,
+        modelPerf,
+        todayExits: todayExitsForMode,
+        equityKRW: exe.accountSnapshot(last)?.equityKRW,
+      });
+
+      if (modeInfo.mode === "COLLECT") {
+        // 📊 데이터 수집 모드: 랜덤 샘플링 (10% 확률)
+        const shouldSample =
+          Math.random() < 0.1 &&
+          !hasExposure &&
+          todayTradeCount < CFG.run.targetTradesMax;
+
+        if (shouldSample) {
+          console.log(`\n📊 수집 모드: ${modeInfo.reason} - 샘플링 진입\n`);
+
+          const entryCtx = {
+            atrPct,
+            atrLo: band.lo,
+            atrHi: band.hi,
+            rvol,
+            rsi,
+            ret1,
+            ret5,
+            emaRatio,
+            vwapDist,
+            prob: probRaw,
+            pStar: dec.pStar,
+            emaFast,
+            emaSlow,
+            vwap: vwapVal,
+            aboveVWAP,
+            imbalance: obm.imbalance,
+            spreadTicks: obm.spreadTicks,
+            bestBidShare: obm.bestBidShare,
+            tpPct: tpPctDyn,
+            slPct: slPctDyn,
+            price: last,
+            mode: "COLLECT",
+          };
+
+          const entryResult = await exe.enterLong({
+            price: last,
+            atrPct,
+            context: { ...entryCtx, sizeScale: 0.2 },
+            sizeScale: 0.2, // 소량 (20%)
+            slPctOverride: slPctDyn,
+          });
+
+          if (entryResult?.ok) {
+            todayTradeCount++;
+            console.log(
+              `\n✅ 수집 모드 진입 성공! 오늘 ${todayTradeCount}/${CFG.run.targetTradesMax}건째 거래\n`
+            );
+          }
+        }
+      } else {
+        // 💰 수익 모드: 기존 로직 (엄격한 진입 조건)
+        if (canEnterNow) {
+          const entryCtx = {
+            atrPct,
+            atrLo: band.lo,
+            atrHi: band.hi,
+            rvol,
+            rsi,
+            ret1,
+            ret5,
+            emaRatio,
+            vwapDist,
+            prob: probRaw,
+            pStar: dec.pStar,
+            emaFast,
+            emaSlow,
+            vwap: vwapVal,
+            aboveVWAP,
+            imbalance: obm.imbalance,
+            spreadTicks: obm.spreadTicks,
+            bestBidShare: obm.bestBidShare,
+            tpPct: tpPctDyn,
+            slPct: slPctDyn,
+            price: last,
+            mode: "PROFIT",
+          };
+
+          const entryResult = await exe.enterLong({
+            price: last,
+            atrPct,
+            context: { ...entryCtx, sizeScale },
+            sizeScale,
+            slPctOverride: slPctDyn,
+          });
+
+          // 진입 성공 시 카운터 증가
+          if (entryResult?.ok) {
+            todayTradeCount++;
+            console.log(
+              `\n✅ 수익 모드 진입 성공! 오늘 ${todayTradeCount}/${CFG.run.targetTradesMax}건째 거래\n`
+            );
+          }
+        }
+      }
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // 일일 성과 계산 (대시보드용)
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      const daily = {
+        trades: todayExitsForMode.length,
+        wins: todayExitsForMode.filter((e) => Number(e.pnlKRW) > 0).length,
+        losses: todayExitsForMode.filter((e) => Number(e.pnlKRW) <= 0).length,
+        pnl: todayExitsForMode.reduce((s, e) => s + Number(e.pnlKRW || 0), 0),
+      };
+
+      const lastTrades = allExitsForStats.slice(-10);
       const sysLog = [];
       if (exe.lastError) {
         sysLog.push({ ts: exe.lastError.ts, msg: exe.lastError.message });
@@ -576,6 +782,8 @@ async function main() {
         pStar: dec.pStar,
         canEnter: canEnterNow,
         blockReason,
+        mode: modeInfo.mode,
+        modeReason: modeInfo.reason,
 
         position: exe.position,
         unrealized,

@@ -36,8 +36,17 @@ export function loadModel(modelPath) {
   }
 }
 
-export function predictProbability(model, values) {
+export function predictProbability(model, values, featureNames) {
   if (!model || !Array.isArray(values)) return NaN;
+  if (
+    Array.isArray(featureNames) &&
+    Array.isArray(model.featureNames) &&
+    featureNames.length === model.featureNames.length
+  ) {
+    for (let i = 0; i < featureNames.length; i++) {
+      if (featureNames[i] !== model.featureNames[i]) return NaN;
+    }
+  }
   const norm = normalize(values, model.mean, model.std);
   let z = model.bias ?? 0;
   for (let i = 0; i < norm.length; i++) {

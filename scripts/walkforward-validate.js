@@ -54,19 +54,26 @@ const parseJsonl = (filePath) => {
 
 function labelAt(candlesAsc, i, horizon, tpPct, slPct, feePct, slipPct) {
   const entry = candlesAsc[i].c;
-  const tpAdj = tpPct + feePct + slipPct;
-  const slAdj = slPct + feePct + slipPct;
+  // [Audit Fix] 왕복 비용 2배 적용 + 룩어헤드 바이어스 제거
+  const tpAdj = tpPct + 2 * (feePct + slipPct);
+  const slAdj = slPct + 2 * (feePct + slipPct);
   const tpPrice = entry * (1 + tpAdj);
   const slPrice = entry * (1 - slAdj);
 
   for (let k = 1; k <= horizon; k++) {
     const c = candlesAsc[i + k];
     if (!c) break;
-    const hitTP = c.h >= tpPrice;
-    const hitSL = c.l <= slPrice;
-    if (hitTP && hitSL) return null;
-    if (hitSL) return 0;
-    if (hitTP) return 1;
+
+    // OHLC 순서 시뮬레이션
+    const upFirst = c.h - c.o >= c.o - c.l;
+
+    if (upFirst) {
+      if (c.h >= tpPrice) return 1;
+      if (c.l <= slPrice) return 0;
+    } else {
+      if (c.l <= slPrice) return 0;
+      if (c.h >= tpPrice) return 1;
+    }
   }
   return 0;
 }
@@ -232,6 +239,28 @@ async function main() {
   console.log(`- Precision: ${((avg.precision / n) * 100).toFixed(2)}%`);
   console.log(`- Recall: ${((avg.recall / n) * 100).toFixed(2)}%`);
   console.log(`- F1: ${((avg.f1 / n) * 100).toFixed(2)}%`);
+
+  // ✅ 결과 저장 (자동 재학습용)
+  const avgWinrate = avg.recall / n; // Recall = TP / (TP + FN) ≈ 승률
+  const avgSharpe = (avg.f1 / n) * 2; // F1 기반 간이 Sharpe (실험적)
+
+  const results = {
+    folds,
+    avgWinrate,
+    avgSharpe,
+    avgAccuracy: avg.acc / n,
+    avgPrecision: avg.precision / n,
+    avgRecall: avg.recall / n,
+    avgF1: avg.f1 / n,
+    foldMetrics: metrics,
+    timestamp: Date.now(),
+  };
+
+  fs.writeFileSync(
+    path.resolve(process.cwd(), "./logs/wf_results.json"),
+    JSON.stringify(results, null, 2)
+  );
+  console.log("\n💾 결과 저장: ./logs/wf_results.json");
 }
 
 main().catch((e) => {

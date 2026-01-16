@@ -103,7 +103,7 @@ export class Executor {
     return null;
   }
 
-  _updateBaseHoldings(market, balance = 0, locked = 0) {
+  _updateBaseHoldings(market, balance = 0, locked = 0, avgBuyPrice = 0) {
     const baseCurrency = market?.split?.("-")?.[1];
     if (!baseCurrency) return;
     const cleanBalance = trimVolumeNumber(balance);
@@ -113,6 +113,7 @@ export class Executor {
       balance: cleanBalance,
       locked: cleanLocked,
       total: cleanBalance + cleanLocked,
+      avgBuyPrice: Number(avgBuyPrice) || 0,
     };
   }
 
@@ -163,7 +164,8 @@ export class Executor {
         const baseAcc = accounts?.find?.((a) => a.currency === baseCurrency);
         const balance = Number(baseAcc?.balance) || 0;
         const locked = Number(baseAcc?.locked) || 0;
-        this._updateBaseHoldings(market, balance, locked);
+        const avgBuyPrice = Number(baseAcc?.avg_buy_price) || 0;
+        this._updateBaseHoldings(market, balance, locked, avgBuyPrice);
       } else {
         this.baseHoldings = null;
       }
@@ -214,7 +216,11 @@ export class Executor {
       if (baseTotal <= 1e-8) return;
       const size = trimVolumeNumber(baseTotal);
       if (size <= 0) return;
-      const entry = lastPrice;
+
+      // [Audit Fix] API(계좌조회)에서 가져온 평단가 우선 사용
+      const avgPrice = this.baseHoldings?.avgBuyPrice;
+      const entry = avgPrice && avgPrice > 0 ? avgPrice : lastPrice;
+
       const sizeKRW = entry * size;
       const positionId = ++this._positionSeq;
       const beFloorPct = Math.max(
@@ -493,6 +499,26 @@ export class Executor {
             price: entry,
             volume: trimVolumeNumber(volumeFilled),
           });
+
+          // ✅ 슬리피지 추적 기록
+          const actualSlip = Math.abs(entry - quote) / quote;
+          const slippageLog = {
+            ts: Date.now(),
+            market,
+            side: "buy",
+            quotedPrice: quote,
+            filledPrice: entry,
+            actualSlip,
+            obSpread: obm?.spreadTicks ?? 0,
+            sizeKRW,
+          };
+          try {
+            fs.appendFileSync(
+              "./logs/slippage.jsonl",
+              JSON.stringify(slippageLog) + "\n"
+            );
+          } catch (_) {}
+
           return {
             ok: true,
             paper: false,
@@ -742,11 +768,19 @@ export class Executor {
       p.movedToBE = true;
     }
 
+    // ✅ TP 진행률 계산 (0~1)
+    const tpProgress = (last - p.entry) / Math.max(1e-9, p.tp - p.entry);
     const trailStop = p.trailHigh * (1 - CFG.strat.TRAIL_PCT);
-    if (p.movedToBE) {
+
+    // ✅ TP 80% 도달 후에만 트레일링 활성화
+    if (tpProgress >= 0.8 && p.movedToBE) {
       p.sl = Math.max(p.sl, trailStop, p.breakEvenPrice);
+    } else if (p.movedToBE) {
+      // TP 80% 미만이면 BE만 유지 (트레일링 없음)
+      p.sl = Math.max(p.sl, p.breakEvenPrice);
     } else {
-      p.sl = Math.max(p.sl, trailStop);
+      // BE 이전에는 약한 트레일링만 (선택적)
+      // p.sl = Math.max(p.sl, trailStop);
     }
 
     // 부분 익절 체크 (신규)

@@ -4,6 +4,38 @@
 import fs from "fs";
 import path from "path";
 
+// ✅ 동적 슬리피지 계산 함수
+function calculateAvgSlippage(days = 7) {
+  const slippagePath = path.resolve(process.cwd(), "./logs/slippage.jsonl");
+  if (!fs.existsSync(slippagePath)) return 0.0003; // 기본값
+
+  try {
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    const lines = fs.readFileSync(slippagePath, "utf8").trim().split("\n");
+    const recent = lines
+      .map((l) => {
+        try {
+          return JSON.parse(l);
+        } catch {
+          return null;
+        }
+      })
+      .filter((e) => e && e.ts >= cutoff && Number.isFinite(e.actualSlip));
+
+    if (recent.length === 0) return 0.0003;
+
+    // 95th percentile 계산
+    const sorted = recent.map((e) => e.actualSlip).sort((a, b) => a - b);
+    const p95Index = Math.floor(sorted.length * 0.95);
+    const p95 = sorted[p95Index] ?? sorted[sorted.length - 1];
+
+    // 95th percentile + 20% 버퍼
+    return Math.max(0.0003, Math.min(0.002, p95 * 1.2));
+  } catch {
+    return 0.0003;
+  }
+}
+
 function loadDotenv() {
   try {
     const p = path.resolve(process.cwd(), ".env");
@@ -34,6 +66,9 @@ const env = (k, d) => process.env[k] ?? d;
 const num = (k, d) => Number(env(k, d));
 const bool = (k, d) => env(k, d) === "true";
 
+// ✅ 동적 슬리피지 계산 (최근 7일 기준)
+const dynamicSlip = calculateAvgSlippage(7);
+
 export const CFG = {
   run: {
     market: env("MARKET", "KRW-BTC"),
@@ -60,7 +95,7 @@ export const CFG = {
     TP: num("TP", 0.045), // Target 4.5%
     SL: num("SL", 0.02), // Stop Loss 2.0%
     FEE: num("FEE", 0.0005),
-    SLIP: num("SLIP", 0.0003),
+    SLIP: num("SLIP", dynamicSlip), // ✅ 동적 슬리피지 적용
 
     // ATR (완화)
     ATR_PERIOD: num("ATR_PERIOD", 14),
@@ -116,6 +151,8 @@ export const CFG = {
     minProb: num("ML_MIN_PROB", 0.58),
     minProbLow: num("ML_MIN_PROB_LOW", 0.58),
     minProbHigh: num("ML_MIN_PROB_HIGH", 0.6),
+    dynamicPstar: bool("ML_DYNAMIC_PSTAR", false),
+    probBuffer: num("ML_PROB_BUFFER", 0),
     timeSplit: bool("ML_TIME_SPLIT", true),
     useOrderbookFeatures: bool("ML_USE_OB_FEATURES", true),
     modelPathOb: env("ML_MODEL_PATH_OB", "./logs/ml_model_ob.json"),
@@ -188,9 +225,9 @@ export const KEYS = {
   secret: env("UPBIT_SECRET_KEY", ""),
 };
 
-// 파생값: 손익분기 승률
+// 파생값: 손익분기 승률 (왕복 비용 2배 적용)
 export const DERIVED = {
   pRequired:
-    (CFG.strat.SL + CFG.strat.FEE + CFG.strat.SLIP) /
-    (CFG.strat.TP + CFG.strat.SL),
+    (CFG.strat.SL + 2 * (CFG.strat.FEE + CFG.strat.SLIP)) /
+    (CFG.strat.TP + CFG.strat.SL + 2 * (CFG.strat.FEE + CFG.strat.SLIP)),
 };

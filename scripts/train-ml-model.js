@@ -54,19 +54,28 @@ const parseJsonl = (filePath) => {
 
 function labelAt(candlesAsc, i, horizon, tpPct, slPct, feePct, slipPct) {
   const entry = candlesAsc[i].c;
-  const tpAdj = tpPct + feePct + slipPct;
-  const slAdj = slPct + feePct + slipPct;
+  // [Audit Fix] 왕복 비용(수수료+슬리피지) 2배 적용 + 룩어헤드 바이어스 제거
+  const tpAdj = tpPct + 2 * (feePct + slipPct);
+  const slAdj = slPct + 2 * (feePct + slipPct);
   const tpPrice = entry * (1 + tpAdj);
   const slPrice = entry * (1 - slAdj);
 
   for (let k = 1; k <= horizon; k++) {
     const c = candlesAsc[i + k];
     if (!c) break;
-    const hitTP = c.h >= tpPrice;
-    const hitSL = c.l <= slPrice;
-    if (hitTP && hitSL) return null; // ambiguous
-    if (hitSL) return 0;
-    if (hitTP) return 1;
+
+    // OHLC 순서 시뮬레이션: Open → High/Low 순서 가정
+    const upFirst = c.h - c.o >= c.o - c.l; // 고가가 저가보다 먼저 도달했을 가능성
+
+    if (upFirst) {
+      // 상승 우선: TP 먼저 체크
+      if (c.h >= tpPrice) return 1;
+      if (c.l <= slPrice) return 0;
+    } else {
+      // 하락 우선: SL 먼저 체크
+      if (c.l <= slPrice) return 0;
+      if (c.h >= tpPrice) return 1;
+    }
   }
   return 0;
 }
