@@ -1,14 +1,16 @@
 {
-  "name": "upbit-auto-trader",
+  "name": "upbit-ml-trader",
   "version": "4.0.0",
-  "description": "Upbit High Win-Rate Trading Bot",
+  "description": "Upbit ML-based Intraday Trading Bot",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
     "start": "dotenv -e .env -- node src/index.js",
-    "analyze:timeouts": "dotenv -e .env -- node scripts/analyze-timeouts.js",
-    "analyze:winrate": "dotenv -e .env -- node scripts/analyze-win-rate.js",
-    "clean-logs": "node scripts/clean-logs.js"
+    "backfill:candles": "dotenv -e .env -- node scripts/backfill-candles.js",
+    "train:ml": "dotenv -e .env -- node scripts/train-ml-model.js",
+    "train:ml:trades": "dotenv -e .env -- node scripts/train-ml-trades.js",
+    "train:ml:regime": "dotenv -e .env -- node scripts/train-ml-regime.js",
+    "validate:walkforward": "dotenv -e .env -- node scripts/walkforward-validate.js"
   },
   "keywords": [
     "upbit",

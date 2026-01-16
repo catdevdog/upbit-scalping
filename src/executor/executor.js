@@ -255,17 +255,29 @@ export class Executor {
     }
   }
 
-  async enterLong({ price, atrPct, market = CFG.run.market, context = null }) {
+  async enterLong({
+    price,
+    atrPct,
+    market = CFG.run.market,
+    context = null,
+    sizeScale = 1,
+    slPctOverride,
+  }) {
     if (this.position) return { ok: false, reason: "이미 포지션 존재" };
     if (this.pendingEntry) return { ok: false, reason: "매수 진행중" };
     if (this.hasOpenExposure())
       return { ok: false, reason: "보유 포지션/주문 존재" };
 
     // 사이징: 잔고% 상한 + (옵션) 손절폭(SL%) 기반 리스크 고정
+    const slPctUsed = Number.isFinite(slPctOverride)
+      ? Number(slPctOverride)
+      : CFG.strat.SL;
     let sizeKRW = this.risk.allocateKRW({
       krwBalance: this.krw,
-      slPct: CFG.strat.SL,
+      slPct: slPctUsed,
     });
+    const scale = Math.max(0, Math.min(1, Number(sizeScale) || 0));
+    sizeKRW = Math.floor(sizeKRW * scale);
     if (sizeKRW < 5000) return { ok: false, reason: "최소주문금액 미달" };
 
     if (!this.paperMode()) {
@@ -581,14 +593,21 @@ export class Executor {
     );
     const breakEvenPrice = entry * (1 + beFloorPct);
 
+    const tpPct = Number.isFinite(Number(ctx?.tpPct))
+      ? Number(ctx.tpPct)
+      : CFG.strat.TP;
+    const slPct = Number.isFinite(Number(ctx?.slPct))
+      ? Number(ctx.slPct)
+      : CFG.strat.SL;
+
     this.position = {
       id: positionId,
       side: "LONG",
       entry,
       sizeKRW: spend,
       size: cleanSize,
-      tp: entry * (1 + CFG.strat.TP),
-      sl: entry * (1 - CFG.strat.SL),
+      tp: entry * (1 + tpPct),
+      sl: entry * (1 - slPct),
       entryTs: tsEpoch,
       movedToBE: false,
       trailHigh: entry,

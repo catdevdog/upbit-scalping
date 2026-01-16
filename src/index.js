@@ -2,15 +2,15 @@
 // 메인 루프: 승률 우선 전략 + 캔들 캐싱 최적화
 
 import { CFG } from "./config/index.js";
+import { spawn } from "node:child_process";
+import path from "node:path";
 import * as Upbit from "./api/upbitAdapter.js";
 import { atrPercent, atrSeriesPercent, atrBandGate } from "./indicators/atr.js";
 import { ema } from "./indicators/ema.js";
 import { vwap } from "./indicators/vwap.js";
 import { analyzeOrderbook } from "./market/orderbook.js";
 import { clamp, nowKSTString } from "./util/math.js";
-import { buildSignal, shouldEnter } from "./strategy/realScalping.js";
 import {
-  checkHighWinRateEntry,
   checkTradingHours,
   checkConsecutiveLosses,
   checkDailyLimits,
@@ -19,6 +19,11 @@ import { Risk } from "./risk/riskManager.js";
 import { Executor } from "./executor/executor.js";
 import { renderDashboard, initTTY } from "./monitor/dashboard.js";
 import { readExits } from "./monitor/tradeLog.js";
+import {
+  buildFeatureVector,
+  buildFeatureVectorWithOrderbook,
+} from "./ml/features.js";
+import { loadModel, predictProbability } from "./ml/model.js";
 
 process.on("uncaughtException", (e) =>
   console.error(`❌ Uncaught: ${e?.message}`)
@@ -60,6 +65,65 @@ async function main() {
   const risk = new Risk(CFG.risk);
   const exe = new Executor(risk);
   await exe.refreshBalance(true, CFG.run.market);
+  const mlEnabled = CFG.ml?.enabled;
+  const mlRegimeEnabled = CFG.ml?.regimeEnabled;
+  let mlModel = mlEnabled ? loadModel(CFG.ml.modelPath) : null;
+  let mlModelOb = mlEnabled ? loadModel(CFG.ml.modelPathOb) : null;
+  let mlModelLow = mlRegimeEnabled ? loadModel(CFG.ml.modelPathLow) : null;
+  let mlModelHigh = mlRegimeEnabled ? loadModel(CFG.ml.modelPathHigh) : null;
+
+  const runScript = (scriptPath, args = []) =>
+    new Promise((resolve, reject) => {
+      const abs = path.resolve(process.cwd(), scriptPath);
+      const proc = spawn(process.execPath, [abs, ...args], {
+        stdio: "inherit",
+        env: process.env,
+      });
+      proc.on("error", reject);
+      proc.on("exit", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`${scriptPath} 종료 코드 ${code}`));
+      });
+    });
+
+  const startAutoRetrain = () => {
+    if (!CFG.ml?.autoRetrain) return;
+    const intervalHours = Number(CFG.ml.retrainIntervalHours ?? 24);
+    const backfillDays = Number(CFG.ml.retrainBackfillDays ?? 7);
+    const delayMin = Number(CFG.ml.retrainInitialDelayMin ?? 5);
+    const intervalMs = Math.max(1, intervalHours) * 60 * 60 * 1000;
+    const delayMs = Math.max(1, delayMin) * 60 * 1000;
+
+    let running = false;
+    const retrain = async () => {
+      if (running) return;
+      running = true;
+      try {
+        console.log("\n🔁 ML 재학습 시작...");
+        await runScript("scripts/backfill-candles.js", [
+          "--days",
+          String(backfillDays),
+        ]);
+        if (CFG.ml?.useOrderbookFeatures) {
+          await runScript("scripts/train-ml-trades.js");
+        } else if (CFG.ml?.regimeEnabled) {
+          await runScript("scripts/train-ml-regime.js");
+        } else {
+          await runScript("scripts/train-ml-model.js");
+        }
+        console.log("✅ ML 재학습 완료\n");
+      } catch (e) {
+        console.error(`❌ ML 재학습 실패: ${e?.message}`);
+      } finally {
+        running = false;
+      }
+    };
+
+    setTimeout(retrain, delayMs);
+    setInterval(retrain, intervalMs);
+  };
+
+  startAutoRetrain();
 
   // 모드/키/잔고 진단 로그 (1회)
   console.log(
@@ -74,7 +138,7 @@ async function main() {
   const snap = Upbit.ensureWS(CFG.run.market);
 
   console.log("━".repeat(80));
-  console.log("🚀 업비트 스캘핑 봇 시작");
+  console.log("🚀 업비트 ML 인트라데이 봇 시작");
   console.log(
     `📊 목표 거래: ${CFG.run.targetTradesMin}~${CFG.run.targetTradesMax}건/일`
   );
@@ -172,41 +236,96 @@ async function main() {
         Math.abs(diffs.filter((x) => x < 0).reduce((a, b) => a + b, 0)) / 14;
       const rs = losses === 0 ? 100 : gains / Math.max(1e-9, losses);
       const rsi = 100 - 100 / (1 + rs);
+      const ret1 =
+        closes.length >= 2 ? (closes[0] - closes[1]) / closes[1] : NaN;
+      const ret5 =
+        closes.length >= 6 ? (closes[0] - closes[5]) / closes[5] : NaN;
+      const emaRatio = emaSlow > 0 ? emaFast / emaSlow - 1 : NaN;
+      const vwapDist =
+        Number.isFinite(vwapVal) && vwapVal > 0
+          ? (last - vwapVal) / vwapVal
+          : NaN;
 
-      // 스코어
-      const rsiScore = clamp((rsi - 45) / 20, 0, 1);
-      let volScore;
-      if (rvol >= 1.9) volScore = 1;
-      else if (rvol >= 1.6)
-        volScore = 0.7 + clamp((rvol - 1.6) / 0.3, 0, 1) * 0.3;
-      else if (rvol >= 1.3)
-        volScore = 0.4 + clamp((rvol - 1.3) / 0.3, 0, 1) * 0.3;
-      else volScore = clamp((rvol - 1.0) / 0.3, 0, 1) * 0.4;
+      // ML 확률 계산 (캔들 기반)
+      if (mlEnabled && !mlRegimeEnabled) mlModel = loadModel(CFG.ml.modelPath);
+      if (mlEnabled && CFG.ml?.useOrderbookFeatures) {
+        mlModelOb = loadModel(CFG.ml.modelPathOb);
+      }
+      if (mlRegimeEnabled) {
+        mlModelLow = loadModel(CFG.ml.modelPathLow);
+        mlModelHigh = loadModel(CFG.ml.modelPathHigh);
+      }
 
-      const obScore = clamp(
-        obm.bestBidShare >= 0.6 &&
-          obm.imbalance >= CFG.strat.MIN_IMB &&
-          obm.spreadTicks <= CFG.strat.MAX_SPREAD_TICKS
-          ? 1
-          : 0.2 +
-              0.6 *
-                clamp((obm.imbalance - CFG.strat.MIN_IMB + 0.05) / 0.4, 0, 1),
-        0,
-        1
-      );
+      const baseModel = mlRegimeEnabled ? mlModelLow || mlModelHigh : mlModel;
+      const useObFeatures = CFG.ml?.useOrderbookFeatures && mlModelOb;
+      const mlFeatures = useObFeatures
+        ? buildFeatureVectorWithOrderbook({
+            candles1m,
+            cfg: CFG,
+            orderbook: obm,
+          })
+        : baseModel
+        ? buildFeatureVector({ candles1m, cfg: CFG })
+        : null;
 
-      const candleScore = Number.isFinite(atrPct)
-        ? clamp((atrPct - 0.1) / 0.3, 0, 1)
+      const atrThreshold = Number(CFG.ml.regimeAtrThreshold ?? 0.06);
+      const isHighVol = Number.isFinite(atrPct) && atrPct >= atrThreshold;
+      const modelToUse = useObFeatures
+        ? mlModelOb
+        : mlRegimeEnabled
+        ? isHighVol
+          ? mlModelHigh
+          : mlModelLow
+        : mlModel;
+      const minProb = mlRegimeEnabled
+        ? Number(isHighVol ? CFG.ml.minProbHigh : CFG.ml.minProbLow)
+        : Number(CFG.ml.minProb ?? 0.58);
+
+      const mlProb =
+        modelToUse && mlFeatures
+          ? predictProbability(modelToUse, mlFeatures.values)
+          : NaN;
+      const fee = Number(CFG.ml.fee ?? CFG.strat.FEE ?? 0);
+      const slip = Number(CFG.ml.slip ?? CFG.strat.SLIP ?? 0);
+
+      const atrFrac = Number.isFinite(atrPct) ? atrPct / 100 : NaN;
+      const tpPctDyn = Number.isFinite(atrFrac)
+        ? clamp(
+            atrFrac * Number(CFG.ml.tpAtrMult ?? 2.2),
+            Number(CFG.ml.tpMin),
+            Number(CFG.ml.tpMax)
+          )
+        : Number(CFG.strat.TP ?? 0);
+      const slPctDyn = Number.isFinite(atrFrac)
+        ? clamp(
+            atrFrac * Number(CFG.ml.slAtrMult ?? 2.8),
+            Number(CFG.ml.slMin),
+            Number(CFG.ml.slMax)
+          )
+        : Number(CFG.strat.SL ?? 0);
+
+      const tpNet = tpPctDyn - fee - slip;
+      const slNet = slPctDyn + fee + slip;
+      const probScale = Number.isFinite(mlProb)
+        ? clamp((mlProb - minProb) / Math.max(1e-9, 1 - minProb), 0, 1)
         : 0;
-
-      const probRaw = buildSignal({
-        rsi: rsiScore,
-        vol: volScore,
-        ob: obScore,
-        candle: candleScore,
-      });
-
-      const dec = shouldEnter(probRaw, null);
+      const ev = Number.isFinite(mlProb)
+        ? mlProb * tpNet - (1 - mlProb) * slNet
+        : -Infinity;
+      const evCap = Number(CFG.ml.evCap ?? 0.01);
+      const evScale = ev > 0 ? clamp(ev / Math.max(1e-9, evCap), 0, 1) : 0;
+      const sizeMin = Number(CFG.ml.sizeMin ?? 0.2);
+      const sizeMax = Number(CFG.ml.sizeMax ?? 1.0);
+      const sizeScale = clamp(
+        probScale * 0.5 + evScale * 0.5,
+        sizeMin,
+        sizeMax
+      );
+      const probRaw = mlProb;
+      const dec = {
+        pass: Number.isFinite(mlProb) && mlProb >= minProb,
+        pStar: minProb,
+      };
 
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
       // 포지션 관리 (기존 포지션 먼저 처리)
@@ -270,27 +389,30 @@ async function main() {
           } else if (!dailyCheck.pass) {
             blockReason = dailyCheck.reason;
           } else {
-            // 승률 우선 진입 조건 종합 체크
-            const entryCheck = checkHighWinRateEntry({
-              currentPrice: last,
-              emaFast,
-              emaSlow,
-              vwap: vwapVal,
-              atrPct,
-              atrLo: band.lo,
-              atrHi: band.hi,
-              rvol,
-              orderbook: obm,
-              rsi,
-              candles1m,
-              probability: probRaw,
-              pStar: dec.pStar,
-            });
+            if (!mlModel) {
+              blockReason = "ML 모델 없음 (학습 후 모델 저장 필요)";
+            } else if (!mlFeatures) {
+              blockReason = "ML 피처 부족 (캔들 데이터 부족)";
+            } else if (CFG.ml?.obRequired) {
+              const obPass =
+                obm.spreadTicks <= CFG.strat.MAX_SPREAD_TICKS &&
+                obm.imbalance >= CFG.strat.MIN_IMB &&
+                obm.bestBidShare >= CFG.strat.MIN_BEST_BID_SHARE;
+              if (!obPass) {
+                blockReason = `오더북 조건 미달: 스프레드 ${
+                  obm.spreadTicks
+                }틱, 불균형 ${(obm.imbalance * 100).toFixed(1)}%, 비드 ${(
+                  obm.bestBidShare * 100
+                ).toFixed(1)}%`;
+              }
+            }
 
-            if (entryCheck.pass) {
-              canEnterNow = true;
+            if (!blockReason && !dec.pass) {
+              blockReason = `ML 확률 부족: p=${(probRaw * 100).toFixed(
+                1
+              )}% < 기준 ${(dec.pStar * 100).toFixed(1)}%`;
             } else {
-              blockReason = entryCheck.reason;
+              canEnterNow = true;
             }
           }
         }
@@ -306,6 +428,10 @@ async function main() {
           atrHi: band.hi,
           rvol,
           rsi,
+          ret1,
+          ret5,
+          emaRatio,
+          vwapDist,
           prob: probRaw,
           pStar: dec.pStar,
           emaFast,
@@ -315,13 +441,17 @@ async function main() {
           imbalance: obm.imbalance,
           spreadTicks: obm.spreadTicks,
           bestBidShare: obm.bestBidShare,
+          tpPct: tpPctDyn,
+          slPct: slPctDyn,
           price: last,
         };
 
         const entryResult = await exe.enterLong({
           price: last,
           atrPct,
-          context: entryCtx,
+          context: { ...entryCtx, sizeScale },
+          sizeScale,
+          slPctOverride: slPctDyn,
         });
 
         // 진입 성공 시 카운터 증가
@@ -348,6 +478,37 @@ async function main() {
         losses: todayExits.filter((e) => Number(e.pnlKRW) <= 0).length,
         pnl: todayExits.reduce((s, e) => s + Number(e.pnlKRW || 0), 0),
       };
+
+      const perfSamples = exits
+        .filter((e) => Number.isFinite(e?.entryCtx?.prob))
+        .slice(-200);
+      const perfCount = perfSamples.length;
+      let perfWin = 0;
+      let perfPsum = 0;
+      let perfBrier = 0;
+      let perfLogLoss = 0;
+      let perfScaleSum = 0;
+      for (const e of perfSamples) {
+        const p = Math.min(1, Math.max(0, Number(e.entryCtx.prob)));
+        const y = Number(e.pnlKRW) > 0 ? 1 : 0;
+        perfWin += y;
+        perfPsum += p;
+        perfBrier += (p - y) ** 2;
+        const pClip = Math.min(1 - 1e-9, Math.max(1e-9, p));
+        perfLogLoss += -(y * Math.log(pClip) + (1 - y) * Math.log(1 - pClip));
+        if (Number.isFinite(e.entryCtx.sizeScale))
+          perfScaleSum += e.entryCtx.sizeScale;
+      }
+      const modelPerf = perfCount
+        ? {
+            count: perfCount,
+            winrate: perfWin / perfCount,
+            avgProb: perfPsum / perfCount,
+            brier: perfBrier / perfCount,
+            logLoss: perfLogLoss / perfCount,
+            avgSizeScale: perfScaleSum / perfCount,
+          }
+        : null;
 
       const lastTrades = exits.slice(-10);
       const sysLog = [];
@@ -424,6 +585,7 @@ async function main() {
         lastTrades,
         stats,
         daily,
+        modelPerf,
 
         // 거래 건수 정보 추가
         todayTradeCount,

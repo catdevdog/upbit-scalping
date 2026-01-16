@@ -247,6 +247,21 @@ export function renderDashboard(d) {
   line("");
   line(`${bold("🎲 확률")}  p=${pVal}%  p*=${pStarVal}%  ${deltaStr}`);
 
+  if (d.modelPerf?.count) {
+    const mp = d.modelPerf;
+    const wr = (mp.winrate * 100).toFixed(1);
+    const avgP = (mp.avgProb * 100).toFixed(1);
+    const brier = mp.brier.toFixed(4);
+    const ll = mp.logLoss.toFixed(4);
+    const scale = Number.isFinite(mp.avgSizeScale)
+      ? (mp.avgSizeScale * 100).toFixed(0)
+      : "-";
+    line(
+      `${bold("🤖 ML 성능")}  샘플 ${mp.count}  승률 ${wr}%  평균p ${avgP}%`
+    );
+    line(`   Brier ${brier}  LogLoss ${ll}  평균 비중 ${scale}%`);
+  }
+
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // 진입 차단 사유 (있을 경우만)
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

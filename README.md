@@ -1,9 +1,9 @@
 ## !100% vibe coding
 
-# 업비트 자동매매 봇 v3.0
+# 업비트 ML 자동매매 봇 v4.0
 
-Node.js 기반 **BTC 스캘핑** 자동매매 봇.  
-v3.0은 **실거래 주문 경로(JWT)**, **대시보드·용어 설명 강화**, **깜빡임 저감 렌더링**, **체결 로그 기반 통계**, **과거 시간대 분석 스크립트**를 포함합니다.
+Node.js 기반 **BTC 인트라데이(비스캘핑)** 자동매매 봇.  
+v4.0은 **ML 기반 진입**, **대시보드·용어 설명 강화**, **깜빡임 저감 렌더링**, **체결 로그 기반 통계**를 포함합니다.
 
 ---
 
@@ -36,8 +36,7 @@ INTERVAL_MS=300
   \(p^\*=\frac{\text{SL}+\text{FEE}+\text{SLIP}}{\text{TP}+\text{SL}}\)
 - **청산 로직**: TP/SL, 본절 이동(BE), 스톨(STALL), 트레일링(TRAIL), 타임아웃
 - **대시보드**: 저깜빡임 렌더링, 최근 10건 체결, 승률·누적 P&L, 용어 설명(v3.0 갱신)
-- **분석 도구**: “진입 조건 최초 성립” 시간대 히스토그램(KST)
-- **승률 우선 자동 튜너**: ATR/RVOL/Orderbook 데이터를 실시간으로 읽어 TP·SL·STALL·TIMEOUT 및 RVOL/스프레드/imb 기준을 “이론상 승률이 가장 높은” 방향으로 자동 재설정
+- **ML 자동 재학습**: 주기적으로 백필+학습 수행
 
 ---
 
@@ -65,42 +64,42 @@ cp .env.example .env
 
 ```env
 # 앱 메타
-APP_NAME=업비트 스캘핑 Bot
-APP_VERSION=3.0
+APP_NAME=업비트 ML Bot
+APP_VERSION=4.0
 
 # 실행/시장
 MARKET=KRW-BTC
-INTERVAL_MS=300
+INTERVAL_MS=1000
 PAPER=true
 TARGET_TRADES_MIN=18
 TARGET_TRADES_MAX=35
 
-# 전략(초단타 프리셋)
-TP=0.0008          # +0.08% 익절
-SL=0.0012          # -0.12% 손절
+# 전략(인트라데이 프리셋)
+TP=0.012
+SL=0.015
 FEE=0.0005
 SLIP=0.0003
 
 ATR_PERIOD=14
 ATR_P_LO=0.25
-ATR_P_HI=0.70
-MIN_ATR_PCT=0.035
+ATR_P_HI=0.80
+MIN_ATR_PCT=0.05
 
-RVOL_BASE_MIN=60
-MIN_RVOL=1.4
+RVOL_BASE_MIN=120
+MIN_RVOL=1.5
 
-TREND_EMA_FAST=15
-TREND_EMA_SLOW=40
+TREND_EMA_FAST=20
+TREND_EMA_SLOW=60
 REQUIRE_VWAP_ABOVE=true
 
-MAX_SPREAD_TICKS=1
+MAX_SPREAD_TICKS=2
 MIN_IMB=0.25
 
-TIMEOUT_SEC=22
-STALL_SEC=12
-BE_TRIGGER=0.0005
-BE_OFFSET=0.0002
-TRAIL_PCT=0.0008
+TIMEOUT_SEC=2400
+STALL_SEC=1200
+BE_TRIGGER=0.006
+BE_OFFSET=0.002
+TRAIL_PCT=0.005
 
 # 로그/UI
 LOG_DIR=./logs
@@ -113,42 +112,41 @@ MIN_RENDER_MS=120
 UPBIT_ACCESS_KEY=
 UPBIT_SECRET_KEY=
 
-# 분석 스크립트
-ANALYZE_DAYS=14
-ANALYZE_IGNORE_OB=true
-ANALYZE_RPS=4
+ML_ENABLED=true
+ML_USE_OB_FEATURES=true
+ML_MODEL_PATH_OB=./logs/ml_model_ob.json
 ```
 
 ### 환경 변수 표
 
-| 키                            | 설명                        | 기본값                   |
-| ----------------------------- | --------------------------- | ------------------------ |
-| `APP_NAME`, `APP_VERSION`     | 대시보드 타이틀             | 업비트 스캘핑 Bot, 3.0   |
-| `MARKET`                      | 거래 마켓                   | `KRW-BTC`                |
-| `INTERVAL_MS`                 | 루프 간격(ms)               | `300`                    |
-| `PAPER`                       | 모의거래 여부               | `true`                   |
-| `TP`, `SL`                    | 익절·손절(비율)             | `0.0008`, `0.0012`       |
-| `FEE`, `SLIP`                 | 왕복 수수료·평균 슬리피지   | `0.0005`, `0.0003`       |
-| `ATR_PERIOD`                  | ATR 기간(분)                | `14`                     |
-| `ATR_P_LO`, `ATR_P_HI`        | ATR 분위수 하·상한          | `0.25`, `0.70`           |
-| `MIN_ATR_PCT`                 | 최소 ATR%(절대 하한)        | `0.035`                  |
-| `RVOL_BASE_MIN`               | RVOL 기준 구간(분)          | `60`                     |
-| `MIN_RVOL`                    | 최소 RVOL                   | `1.4`                    |
-| `TREND_EMA_FAST/SLOW`         | 5분봉 EMA 15/40             | `15`, `40`               |
-| `REQUIRE_VWAP_ABOVE`          | 가격 ≥ VWAP 요구 여부       | `true`                   |
-| `MAX_SPREAD_TICKS`            | 허용 스프레드 틱            | `1`                      |
-| `MIN_IMB`                     | 최소 호가 불균형(매수 우위) | `0.25`                   |
-| `TIMEOUT_SEC`, `STALL_SEC`    | 보유·스톨 제한(s)           | `22`, `12`               |
-| `BE_TRIGGER/BE_OFFSET`        | 본절 이동 트리거·오프셋     | `0.0005`, `0.0002`       |
-| `TRAIL_PCT`                   | 트레일링 폭                 | `0.0008`                 |
-| `LOG_DIR`, `TRADE_LOG`        | 로그 폴더/파일명            | `./logs`, `trades.jsonl` |
-| `SHOW_GLOSSARY`               | 용어 설명 표시              | `true`                   |
-| `USE_ALT_SCREEN`              | 대체 화면 버퍼 사용         | `true`                   |
-| `MIN_RENDER_MS`               | 최소 렌더 간격(ms)          | `120`                    |
-| `UPBIT_ACCESS_KEY/SECRET_KEY` | 업비트 API 키               | 빈값                     |
-| `ANALYZE_DAYS`                | 분석 일수                   | `14`                     |
-| `ANALYZE_IGNORE_OB`           | 과거 분석 시 호가조건 무시  | `true`                   |
-| `ANALYZE_RPS`                 | 분석 호출 RPS               | `4`                      |
+| 키                            | 설명                        | 기본값                    |
+| ----------------------------- | --------------------------- | ------------------------- |
+| `APP_NAME`, `APP_VERSION`     | 대시보드 타이틀             | 업비트 ML Bot, 4.0        |
+| `MARKET`                      | 거래 마켓                   | `KRW-BTC`                 |
+| `INTERVAL_MS`                 | 루프 간격(ms)               | `300`                     |
+| `PAPER`                       | 모의거래 여부               | `true`                    |
+| `TP`, `SL`                    | 익절·손절(비율)             | `0.0008`, `0.0012`        |
+| `FEE`, `SLIP`                 | 왕복 수수료·평균 슬리피지   | `0.0005`, `0.0003`        |
+| `ATR_PERIOD`                  | ATR 기간(분)                | `14`                      |
+| `ATR_P_LO`, `ATR_P_HI`        | ATR 분위수 하·상한          | `0.25`, `0.70`            |
+| `MIN_ATR_PCT`                 | 최소 ATR%(절대 하한)        | `0.035`                   |
+| `RVOL_BASE_MIN`               | RVOL 기준 구간(분)          | `60`                      |
+| `MIN_RVOL`                    | 최소 RVOL                   | `1.4`                     |
+| `TREND_EMA_FAST/SLOW`         | 5분봉 EMA 15/40             | `15`, `40`                |
+| `REQUIRE_VWAP_ABOVE`          | 가격 ≥ VWAP 요구 여부       | `true`                    |
+| `MAX_SPREAD_TICKS`            | 허용 스프레드 틱            | `1`                       |
+| `MIN_IMB`                     | 최소 호가 불균형(매수 우위) | `0.25`                    |
+| `TIMEOUT_SEC`, `STALL_SEC`    | 보유·스톨 제한(s)           | `22`, `12`                |
+| `BE_TRIGGER/BE_OFFSET`        | 본절 이동 트리거·오프셋     | `0.0005`, `0.0002`        |
+| `TRAIL_PCT`                   | 트레일링 폭                 | `0.0008`                  |
+| `LOG_DIR`, `TRADE_LOG`        | 로그 폴더/파일명            | `./logs`, `trades.jsonl`  |
+| `SHOW_GLOSSARY`               | 용어 설명 표시              | `true`                    |
+| `USE_ALT_SCREEN`              | 대체 화면 버퍼 사용         | `true`                    |
+| `MIN_RENDER_MS`               | 최소 렌더 간격(ms)          | `120`                     |
+| `UPBIT_ACCESS_KEY/SECRET_KEY` | 업비트 API 키               | 빈값                      |
+| `ML_ENABLED`                  | ML 사용 여부                | `true`                    |
+| `ML_USE_OB_FEATURES`          | 오더북 피처 사용            | `true`                    |
+| `ML_MODEL_PATH_OB`            | 오더북 모델 경로            | `./logs/ml_model_ob.json` |
 
 > ⚠️ `TP`, `SL`, `TIMEOUT_SEC`, `STALL_SEC`, `MIN_RVOL`, `MAX_SPREAD_TICKS`, `MIN_IMB` 는 이제 **동적 승률 튜너의 바닥값**입니다. 런타임에서는 ATR·RVOL·호가 상태에 따라 이 값 이상으로 자동 상향되어, 항상 수수료를 제외하고도 “이론상 승률이 최대”인 조합을 사용합니다.
 
@@ -232,19 +230,6 @@ PAPER=false node src/index.js
 
 ---
 
-## 과거 시간대 분석 스크립트
-
-최근 N일 동안 “**진입 조건이 처음 성립**”한 시각의 KST 분포를 출력합니다. 레이트리밋 안전(스로틀+백오프) 버전입니다.
-
-```bash
-# 권장(호가조건 무시)
-node scripts/analyze-entry-windows.js --days=14 --ignore-ob=true --rps=4
-```
-
-출력: **시간대 히스토그램(0~23시)**, **요일 분포**, **상위 시간대 Top 3**
-
----
-
 ## 폴더 구조
 
 ```
@@ -258,7 +243,10 @@ node scripts/analyze-entry-windows.js --days=14 --ignore-ob=true --rps=4
 │  ├─ util/              # 수학/시간/틱 유틸
 │  └─ index.js           # 메인 루프
 ├─ scripts/
-│  └─ analyze-entry-windows.js
+│  ├─ backfill-candles.js
+│  ├─ train-ml-model.js
+│  ├─ train-ml-trades.js
+│  └─ walkforward-validate.js
 ├─ logs/
 │  └─ trades.jsonl       # 체결 로그(JSON Lines)
 ├─ .env.example

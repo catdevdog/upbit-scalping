@@ -109,10 +109,10 @@ export async function getTrades(market, count = 50) {
   return httpGet("/trades/ticks", { market, count }, buckets.trades);
 }
 
-export async function getMinuteCandles(unit, market, count = 200) {
+export async function getMinuteCandles(unit, market, count = 200, to) {
   const raw = await httpGet(
     `/candles/minutes/${unit}`,
-    { market, count },
+    { market, count, to },
     buckets.candles
   );
   return raw.map((c) => ({
