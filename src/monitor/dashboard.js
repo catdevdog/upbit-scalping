@@ -272,6 +272,54 @@ export function renderDashboard(d) {
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // 시장 모드 (TREND/RANGE/NEUTRAL)
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  if (d.marketMode) {
+    const modeColor =
+      d.marketMode === "TREND"
+        ? green
+        : d.marketMode === "RANGE"
+        ? cyan
+        : yellow;
+    const modeIcon =
+      d.marketMode === "TREND" ? "📈" : d.marketMode === "RANGE" ? "↔️" : "⏸️";
+    const atrRatioStr = Number.isFinite(d.atrRatio)
+      ? d.atrRatio.toFixed(2)
+      : "N/A";
+
+    line("");
+    line(
+      `${bold("🎯 시장 모드")}  ${modeColor(
+        modeIcon + " " + d.marketMode
+      )}  ATR비율: ${atrRatioStr}x`
+    );
+
+    // 모드 설명
+    if (d.marketMode === "TREND") {
+      line(dim("   → TREND: ML 확률(p≥p*) 기반 진입, 고변동성 추세추종"));
+    } else if (d.marketMode === "RANGE") {
+      line(dim("   → RANGE: BB하단 근접 시 진입, 저변동성 평균회귀"));
+    } else {
+      line(dim("   → NEUTRAL: RANGE로 처리됨"));
+    }
+
+    if (d.bb && Number.isFinite(d.bb.lower)) {
+      const bbLower = Math.round(d.bb.lower);
+      const bbMiddle = Math.round(d.bb.middle);
+      const bbUpper = Math.round(d.bb.upper);
+      line(
+        `   BB: ${red(fmtKRW(bbLower))} < ${yellow(fmtKRW(bbMiddle))} < ${green(
+          fmtKRW(bbUpper)
+        )}`
+      );
+    }
+
+    if (d.rangeEnabled && d.todayRangeTradeCount !== undefined) {
+      line(`   레인지 거래: ${d.todayRangeTradeCount}/5건`);
+    }
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // 진입 차단 사유 (있을 경우만)
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (d.blockReason) {

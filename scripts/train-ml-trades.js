@@ -139,8 +139,9 @@ function buildDataset(events) {
 async function main() {
   const events = readEvents(input);
   const { X, y, ts, featureNames } = buildDataset(events);
-  if (X.length < 200) {
-    throw new Error("샘플 부족: 최소 200개 이상의 EXIT 기록이 필요합니다.");
+  // 개선 4: 최소 샘플 수 200 → 500으로 증가
+  if (X.length < 500) {
+    throw new Error("샘플 부족: 최소 500개 이상의 EXIT 기록이 필요합니다.");
   }
 
   const timeSplit = CFG.ml.timeSplit !== false;

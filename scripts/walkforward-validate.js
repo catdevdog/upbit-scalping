@@ -179,17 +179,20 @@ function buildDataset(rows) {
 
 async function main() {
   const rows = parseJsonl(input).sort((a, b) => a.ts - b.ts);
-  if (rows.length < 1000) {
-    throw new Error("데이터가 부족합니다. 최소 1000개 이상 필요합니다.");
+  // 개선 4: 최소 데이터 1000 → 5000으로 증가
+  if (rows.length < 5000) {
+    throw new Error("데이터가 부족합니다. 최소 5,000개 이상 필요합니다.");
   }
 
   const { X, y, ts } = buildDataset(rows);
-  if (X.length < 500) {
+  // 개선 4: 최소 샘플 500 → 2000으로 증가
+  if (X.length < 2000) {
     throw new Error("학습 가능한 샘플이 부족합니다. 기간을 늘려주세요.");
   }
 
   const foldSize = Math.floor(X.length / (folds + 1));
-  if (foldSize < 200) {
+  // 개선 4: 최소 폴드 크기 200 → 400으로 증가
+  if (foldSize < 400) {
     throw new Error("폴드 크기가 너무 작습니다. folds 값을 줄이세요.");
   }
 

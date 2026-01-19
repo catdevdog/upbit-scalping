@@ -1,5 +1,5 @@
 // src/index.js
-// 메인 루프: 승률 우선 전략 + 캔들 캐싱 최적화
+// 메인 루프: 승률 우선 전략 + 캔들 캐싱 최적화 + 듀얼 모드 (TREND/RANGE)
 
 import { CFG, DERIVED, PATHS } from "./config/index.js";
 import fs from "node:fs";
@@ -9,13 +9,16 @@ import * as Upbit from "./api/upbitAdapter.js";
 import { atrPercent, atrSeriesPercent, atrBandGate } from "./indicators/atr.js";
 import { ema } from "./indicators/ema.js";
 import { vwap } from "./indicators/vwap.js";
+import { bollingerBands } from "./indicators/bollinger.js";
 import { analyzeOrderbook } from "./market/orderbook.js";
+import { ModeDetector } from "./market/modeDetector.js";
 import { clamp, nowKSTString } from "./util/math.js";
 import {
   checkTradingHours,
   checkConsecutiveLosses,
   checkDailyLimits,
 } from "./strategy/highWinRateEntry.js";
+import { checkRangeEntry, calcRangePStar } from "./strategy/rangeScalping.js";
 import { Risk } from "./risk/riskManager.js";
 import { Executor } from "./executor/executor.js";
 import { renderDashboard, initTTY } from "./monitor/dashboard.js";
@@ -48,18 +51,32 @@ let lastProbLogPStar = NaN;
 // 일일 거래 건수 추적 (목표: 10~15건)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 let todayTradeCount = 0;
+let todayRangeTradeCount = 0; // 레인지 모드 일일 거래 수
+let rangeConsecutiveLosses = 0; // 레인지 모드 연속 손실
 // 업비트(한국) 기준 일자(KST)로 리셋되도록 날짜 키를 KST로 계산
 const kstDateKey = () =>
   new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
 let lastResetDate = kstDateKey(); // YYYY-MM-DD (KST)
 
+// 모드 감지기 초기화
+const modeDetector = new ModeDetector({
+  trendThreshold: CFG.range?.ATR_TREND_THRESHOLD ?? 1.2,
+  rangeThreshold: CFG.range?.ATR_RANGE_THRESHOLD ?? 0.8,
+  lookbackPeriod: CFG.range?.ATR_LOOKBACK ?? 30,
+  cooldownSec: CFG.range?.MODE_COOLDOWN_SEC ?? 300,
+});
+
 function resetDailyCounter() {
   const currentDate = kstDateKey();
   if (currentDate !== lastResetDate) {
     console.log(`\n🔄 일일 카운터 리셋: ${lastResetDate} → ${currentDate}`);
-    console.log(`   어제 거래: ${todayTradeCount}건\n`);
+    console.log(
+      `   어제 거래: ${todayTradeCount}건 (레인지: ${todayRangeTradeCount}건)\n`
+    );
     todayTradeCount = 0;
+    todayRangeTradeCount = 0;
+    rangeConsecutiveLosses = 0;
     lastResetDate = currentDate;
   }
 }
@@ -272,6 +289,11 @@ async function main() {
       const vwapVal = vwap(candles1m, 120);
       const aboveVWAP = Number.isFinite(vwapVal) ? last >= vwapVal : false;
 
+      // 볼린저밴드 (레인지 모드용)
+      const bbPeriod = CFG.range?.BB_PERIOD ?? 20;
+      const bbStdDev = CFG.range?.BB_STDDEV ?? 2;
+      const bb = bollingerBands(candles1m, bbPeriod, bbStdDev);
+
       // RSI
       const closes = candles1m.map((c) => c.c).slice(0, 60);
       const diffs = [];
@@ -291,6 +313,13 @@ async function main() {
         Number.isFinite(vwapVal) && vwapVal > 0
           ? (last - vwapVal) / vwapVal
           : NaN;
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // 시장 모드 판단 (TREND / RANGE / NEUTRAL)
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      const atrForMode = Number.isFinite(atrPct) ? atrPct : 0;
+      const modeResult = modeDetector.update(atrForMode);
+      const marketMode = modeResult.mode;
 
       // ML 확률 계산 (캔들 기반)
       if (mlEnabled && !mlRegimeEnabled) mlModel = loadModel(CFG.ml.modelPath);
@@ -547,12 +576,44 @@ async function main() {
               }
             }
 
-            if (!blockReason && !dec.pass) {
-              blockReason = `ML 확률 부족: p=${(probRaw * 100).toFixed(
-                1
-              )}% < 기준 ${(dec.pStar * 100).toFixed(1)}%`;
-            } else {
-              canEnterNow = true;
+            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            // 모드별 진입 조건 체크
+            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            if (!blockReason) {
+              if (marketMode === "TREND" || marketMode === "NEUTRAL") {
+                // 트렌드/중립 모드: ML 확률 기반 (기존 로직)
+                if (!dec.pass) {
+                  blockReason = `[${marketMode}] ML 확률 부족: p=${(
+                    probRaw * 100
+                  ).toFixed(1)}% < 기준 ${(dec.pStar * 100).toFixed(1)}%`;
+                } else {
+                  canEnterNow = true;
+                }
+              } else if (marketMode === "RANGE" && CFG.range?.ENABLED) {
+                // 레인지 모드: BB + RSI 기반
+                const rangeMaxDaily = CFG.range?.MAX_DAILY_TRADES ?? 5;
+                const rangeMaxConsecLoss =
+                  CFG.range?.MAX_CONSECUTIVE_LOSSES ?? 2;
+
+                if (todayRangeTradeCount >= rangeMaxDaily) {
+                  blockReason = `[RANGE] 일일 한도 도달 (${todayRangeTradeCount}/${rangeMaxDaily})`;
+                } else if (rangeConsecutiveLosses >= rangeMaxConsecLoss) {
+                  blockReason = `[RANGE] 연속 손실 ${rangeConsecutiveLosses}회 - 당일 중단`;
+                } else {
+                  const rangeCheck = checkRangeEntry(last, bb, rsi, {
+                    rsiOversold: CFG.range?.RSI_OVERSOLD ?? 35,
+                    rsiOverbought: CFG.range?.RSI_OVERBOUGHT ?? 65,
+                    bbMargin: CFG.range?.BB_MARGIN ?? 0.001,
+                  });
+
+                  if (rangeCheck.pass) {
+                    canEnterNow = true;
+                    blockReason = null; // 진입 허용
+                  } else {
+                    blockReason = `[RANGE] ${rangeCheck.reason}`;
+                  }
+                }
+              }
             }
           }
         }
@@ -704,6 +765,55 @@ async function main() {
             );
           }
         }
+
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // 레인지 모드 진입 (별도 처리)
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if (
+          !hasExposure &&
+          marketMode === "RANGE" &&
+          canEnterNow &&
+          CFG.range?.ENABLED
+        ) {
+          const rangeTP = CFG.range?.TP ?? 0.004;
+          const rangeSL = CFG.range?.SL ?? 0.0025;
+          const rangePositionPct = CFG.range?.POSITION_PCT ?? 0.1;
+          const rangePStar = calcRangePStar(rangeTP, rangeSL, fee, slip);
+
+          const rangeCtx = {
+            atrPct,
+            rvol,
+            rsi,
+            bb: { upper: bb.upper, lower: bb.lower, middle: bb.middle },
+            prob: probRaw,
+            pStar: rangePStar,
+            tpPct: rangeTP,
+            slPct: rangeSL,
+            price: last,
+            mode: "RANGE",
+            marketMode,
+            atrRatio: modeResult.atrRatio,
+          };
+
+          const rangeResult = await exe.enterLong({
+            price: last,
+            atrPct,
+            context: { ...rangeCtx, sizeScale: rangePositionPct },
+            sizeScale: rangePositionPct,
+            slPctOverride: rangeSL,
+            tpPctOverride: rangeTP,
+            timeoutOverride: CFG.range?.TIMEOUT_SEC ?? 600,
+          });
+
+          if (rangeResult?.ok) {
+            todayTradeCount++;
+            todayRangeTradeCount++;
+            console.log(
+              `\n✅ 레인지 모드 진입! BB하단 + RSI=${rsi.toFixed(1)} | ` +
+                `오늘 레인지 ${todayRangeTradeCount}건, 전체 ${todayTradeCount}건\n`
+            );
+          }
+        }
       }
 
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -784,6 +894,19 @@ async function main() {
         blockReason,
         mode: modeInfo.mode,
         modeReason: modeInfo.reason,
+
+        // 시장 모드 정보 (TREND/RANGE/NEUTRAL)
+        marketMode,
+        marketModeReason: modeResult.reason,
+        atrRatio: modeResult.atrRatio,
+        bb: {
+          upper: bb.upper,
+          lower: bb.lower,
+          middle: bb.middle,
+          bandwidth: bb.bandwidth,
+        },
+        rangeEnabled: CFG.range?.ENABLED,
+        todayRangeTradeCount,
 
         position: exe.position,
         unrealized,

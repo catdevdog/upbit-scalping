@@ -4,10 +4,10 @@
 import fs from "fs";
 import path from "path";
 
-// ✅ 동적 슬리피지 계산 함수
+// ✅ 동적 슬리피지 계산 함수 (개선 6: 기본값 상향)
 function calculateAvgSlippage(days = 7) {
   const slippagePath = path.resolve(process.cwd(), "./logs/slippage.jsonl");
-  if (!fs.existsSync(slippagePath)) return 0.0003; // 기본값
+  if (!fs.existsSync(slippagePath)) return 0.0008; // 기본값 0.08%로 상향
 
   try {
     const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
@@ -22,17 +22,17 @@ function calculateAvgSlippage(days = 7) {
       })
       .filter((e) => e && e.ts >= cutoff && Number.isFinite(e.actualSlip));
 
-    if (recent.length === 0) return 0.0003;
+    if (recent.length === 0) return 0.0008;
 
     // 95th percentile 계산
     const sorted = recent.map((e) => e.actualSlip).sort((a, b) => a - b);
     const p95Index = Math.floor(sorted.length * 0.95);
     const p95 = sorted[p95Index] ?? sorted[sorted.length - 1];
 
-    // 95th percentile + 20% 버퍼
-    return Math.max(0.0003, Math.min(0.002, p95 * 1.2));
+    // 95th percentile + 30% 버퍼 (개선 6)
+    return Math.max(0.0005, Math.min(0.003, p95 * 1.3));
   } catch {
-    return 0.0003;
+    return 0.0008; // 기본값 0.08%
   }
 }
 
@@ -78,22 +78,22 @@ export const CFG = {
     targetTradesMax: num("TARGET_TRADES_MAX", 3), // Low frequency: max 3 trades
   },
 
-  // 리스크/사이징 (수익률(복리) 안정화를 위해 올인 방지)
+  // 리스크/사이징 (개선 2: 포지션 비중 축소)
   risk: {
-    // 1회 진입에 사용할 잔고 상한 비율 (예: 0.9 = 90% - Low Freq)
-    positionPctMax: num("POSITION_PCT_MAX", 0.9),
-    // 트레이드당 허용 손실 비율 (예: 0.005 = 0.5%). 0이면 비활성
-    riskPctPerTrade: num("RISK_PCT_PER_TRADE", 0),
+    // 1회 진입에 사용할 잔고 상한 비율 (개선 2: 90% → 25%로 축소)
+    positionPctMax: num("POSITION_PCT_MAX", 0.25),
+    // 트레이드당 허용 손실 비율 (개선 2: 1% 활성화)
+    riskPctPerTrade: num("RISK_PCT_PER_TRADE", 0.01),
     // 최소 주문 금액(KRW)
     minSize: num("MIN_ORDER_KRW", 5000),
-    // 절대 상한(KRW). 0이면 무제한
-    maxSize: num("MAX_ORDER_KRW", 0),
+    // 절대 상한(KRW) (개선 2: 100만원 상한 추가)
+    maxSize: num("MAX_ORDER_KRW", 1000000),
   },
 
   strat: {
-    // 손익 (저빈도 수익 지향: 1:2 손익비)
-    TP: num("TP", 0.045), // Target 4.5%
-    SL: num("SL", 0.02), // Stop Loss 2.0%
+    // 손익 (인트라데이에 적합한 수준)
+    TP: num("TP", 0.008), // Target 0.8%
+    SL: num("SL", 0.005), // Stop Loss 0.5% → p* = 38.5%
     FEE: num("FEE", 0.0005),
     SLIP: num("SLIP", dynamicSlip), // ✅ 동적 슬리피지 적용
 
@@ -131,12 +131,46 @@ export const CFG = {
     MIN_PROB_ENTRY: num("MIN_PROB_ENTRY", 0.72), // ✅ 0.78 → 0.72
     PROB_BUFFER: num("PROB_BUFFER", 0.06), // ✅ 0.08 → 0.06
 
-    // 청산 (저빈도 수익 지향)
-    TIMEOUT_SEC: num("TIMEOUT_SEC", 21600), // 6 hours
-    STALL_SEC: num("STALL_SEC", 3600), // 1 hour stall check
-    BE_TRIGGER: num("BE_TRIGGER", 0.003),
-    BE_OFFSET: num("BE_OFFSET", 0.0008),
-    TRAIL_PCT: num("TRAIL_PCT", 0.0012), // ✅ 0.0015 → 0.0012
+    // 청산 (인트라데이에 적합)
+    TIMEOUT_SEC: num("TIMEOUT_SEC", 1800), // 30분
+    STALL_SEC: num("STALL_SEC", 600), // 10분
+    BE_TRIGGER: num("BE_TRIGGER", 0.003), // 0.3% 도달 시 BE 이동
+    BE_OFFSET: num("BE_OFFSET", 0.001), // BE는 진입가 +0.1%
+    TRAIL_PCT: num("TRAIL_PCT", 0.002), // 트레일링 0.2%
+  },
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // 레인지 모드 설정 (횡보장 평균회귀 전략)
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  range: {
+    ENABLED: bool("RANGE_MODE_ENABLED", true),
+
+    // 모드 판단 기준 (ATR 비율)
+    ATR_TREND_THRESHOLD: num("MODE_ATR_TREND", 1.2), // 1.2배 이상 → TREND
+    ATR_RANGE_THRESHOLD: num("MODE_ATR_RANGE", 1.0), // 1.0배 이하 → RANGE (완화: 0.8→1.0)
+    ATR_LOOKBACK: num("MODE_ATR_LOOKBACK", 30), // 30봉 평균 기준
+    MODE_COOLDOWN_SEC: num("MODE_COOLDOWN_SEC", 300), // 모드 전환 쿨다운 5분
+
+    // 볼린저밴드 설정
+    BB_PERIOD: num("RANGE_BB_PERIOD", 20),
+    BB_STDDEV: num("RANGE_BB_STDDEV", 2),
+    BB_MARGIN: num("RANGE_BB_MARGIN", 0.005), // BB 밴드 0.5% 여유 (완화)
+
+    // RSI 기준 (완화: 35→40)
+    RSI_OVERSOLD: num("RANGE_RSI_OVERSOLD", 40),
+    RSI_OVERBOUGHT: num("RANGE_RSI_OVERBOUGHT", 60),
+
+    // 손익 설정 (p* = 0.25/0.65 = 38.5%)
+    TP: num("RANGE_TP", 0.004), // 0.4%
+    SL: num("RANGE_SL", 0.0025), // 0.25%
+    TIMEOUT_SEC: num("RANGE_TIMEOUT", 600), // 10분
+
+    // 포지션 사이징 (보수적)
+    POSITION_PCT: num("RANGE_POSITION_PCT", 0.1), // 10%
+
+    // 일일 제한
+    MAX_DAILY_TRADES: num("RANGE_MAX_DAILY_TRADES", 5),
+    MAX_CONSECUTIVE_LOSSES: num("RANGE_MAX_CONSEC_LOSSES", 2),
   },
 
   ml: {
@@ -157,14 +191,14 @@ export const CFG = {
     useOrderbookFeatures: bool("ML_USE_OB_FEATURES", true),
     modelPathOb: env("ML_MODEL_PATH_OB", "./logs/ml_model_ob.json"),
     obRequired: bool("ML_OB_REQUIRED", true),
-    tp: num("ML_TP", num("TP", 0.045)),
-    sl: num("ML_SL", num("SL", 0.02)),
-    tpAtrMult: num("ML_TP_ATR_MULT", 2.2),
-    slAtrMult: num("ML_SL_ATR_MULT", 2.8),
-    tpMin: num("ML_TP_MIN", 0.003),
-    tpMax: num("ML_TP_MAX", 0.02),
-    slMin: num("ML_SL_MIN", 0.004),
-    slMax: num("ML_SL_MAX", 0.03),
+    tp: num("ML_TP", num("TP", 0.008)), // 개선 1: 0.045 → 0.008
+    sl: num("ML_SL", num("SL", 0.005)), // 개선 1: 0.02 → 0.005
+    tpAtrMult: num("ML_TP_ATR_MULT", 1.5), // 개선 1: 2.2 → 1.5 (ATR의 1.5배)
+    slAtrMult: num("ML_SL_ATR_MULT", 1.0), // 개선 1: 2.8 → 1.0 (ATR의 1배)
+    tpMin: num("ML_TP_MIN", 0.004), // 개선 1: 0.003 → 0.004 (최소 0.4%)
+    tpMax: num("ML_TP_MAX", 0.012), // 개선 1: 0.02 → 0.012 (최대 1.2%)
+    slMin: num("ML_SL_MIN", 0.003), // 개선 1: 0.004 → 0.003 (최소 0.3%)
+    slMax: num("ML_SL_MAX", 0.008), // 개선 1: 0.03 → 0.008 (최대 0.8%)
     emaFast: num("ML_EMA_FAST", 20),
     emaSlow: num("ML_EMA_SLOW", 60),
     rsiPeriod: num("ML_RSI_PERIOD", 14),
@@ -191,12 +225,16 @@ export const CFG = {
     TRADING_HOURS_START: num("TRADING_HOURS_START", 9),
     TRADING_HOURS_END: num("TRADING_HOURS_END", 23),
     AVOID_WEEKENDS: bool("AVOID_WEEKENDS", true),
-    // 신규: 손실 여부와 무관하게, 진입 간 최소 간격(저빈도 운용용)
-    MIN_ENTRY_GAP_MINUTES: num("MIN_ENTRY_GAP_MINUTES", 0),
-    MAX_CONSECUTIVE_LOSSES: num("MAX_CONSECUTIVE_LOSSES", 2),
-    COOLDOWN_AFTER_LOSS_MINUTES: num("COOLDOWN_AFTER_LOSS_MINUTES", 20),
-    MAX_DAILY_LOSSES: num("MAX_DAILY_LOSSES", 20),
-    DAILY_LOSS_LIMIT_PCT: num("DAILY_LOSS_LIMIT_PCT", 0.1),
+    // 개선 3: 최소 10분 간격 추가
+    MIN_ENTRY_GAP_MINUTES: num("MIN_ENTRY_GAP_MINUTES", 10),
+    // 개선 3: 2 → 3연패 후 휴식
+    MAX_CONSECUTIVE_LOSSES: num("MAX_CONSECUTIVE_LOSSES", 3),
+    // 개선 3: 20분 → 30분 휴식
+    COOLDOWN_AFTER_LOSS_MINUTES: num("COOLDOWN_AFTER_LOSS_MINUTES", 30),
+    // 개선 3: 20회 → 5회로 축소
+    MAX_DAILY_LOSSES: num("MAX_DAILY_LOSSES", 5),
+    // 개선 3: 10% → 2.5%로 축소
+    DAILY_LOSS_LIMIT_PCT: num("DAILY_LOSS_LIMIT_PCT", 0.025),
   },
 
   log: {

@@ -1,295 +1,178 @@
-## !100% vibe coding
+# 업비트 ML 자동매매 봇 v4.1
 
-# 업비트 ML 자동매매 봇 v4.0
-
-Node.js 기반 **BTC 인트라데이(비스캘핑)** 자동매매 봇.  
-v4.0은 **ML 기반 진입**, **대시보드·용어 설명 강화**, **깜빡임 저감 렌더링**, **체결 로그 기반 통계**를 포함합니다.
+Node.js 기반 **BTC 인트라데이** 자동매매 봇  
+ML(로지스틱 회귀) 기반 진입 판단 + 리스크 관리 시스템
 
 ---
 
-## 목차
+## 📌 핵심 특징
 
-INTERVAL_MS=300
-
-- [요구 사항](#요구-사항)
-- [설치](#설치)
-- [환경 변수](#환경-변수)
-  - [빠른 시작용 .env 예시](#빠른-시작용-env-예시)
-  - [환경 변수 표](#환경-변수-표)
-- [실행](#실행)
-- [대시보드 가이드](#대시보드-가이드)
-- [전략 상세](#전략-상세)
-  - [진입 조건](#진입-조건)
-- [폴더 구조](#폴더-구조)
-- [v2.0 → v3.0 마이그레이션](#v20--v30-마이그레이션)
-- [트러블슈팅](#트러블슈팅)
-- [면책](#면책)
-- [라이선스](#라이선스)
+| 기능                | 설명                                                     |
+| ------------------- | -------------------------------------------------------- |
+| **ML 기반 진입**    | 로지스틱 회귀 모델이 승률(p) 예측 → p ≥ p\* 충족 시 진입 |
+| **동적 TP/SL**      | ATR 기반 자동 조절 (0.4%~1.2% / 0.3%~0.8%)               |
+| **리스크 관리**     | 포지션 25%, 일일 손실 2.5% 한도, 연속 손실 시 휴식       |
+| **실시간 대시보드** | 확률/지표/거래내역 실시간 표시                           |
+| **자동 재학습**     | 24시간마다 모델 자동 업데이트                            |
 
 ---
 
-## 특징
+## 🚀 빠른 시작
 
-- **LIVE/PAPER 모드 전환**: 실거래·모의거래 스위치
-- **주문 경로**: 업비트 JWT 인증, 시장가/지정가 지원
-- **확률 임계치**: \(p \ge p^\*\), 대시보드에 실시간 표기  
-  \(p^\*=\frac{\text{SL}+\text{FEE}+\text{SLIP}}{\text{TP}+\text{SL}}\)
-- **청산 로직**: TP/SL, 본절 이동(BE), 스톨(STALL), 트레일링(TRAIL), 타임아웃
-- **대시보드**: 저깜빡임 렌더링, 최근 10건 체결, 승률·누적 P&L, 용어 설명(v3.0 갱신)
-- **ML 자동 재학습**: 주기적으로 백필+학습 수행
-
----
-
-## 요구 사항
-
-- Node.js **18+**
-- 업비트 **API 키**(실거래 시)
-- macOS/Linux/Windows(WSL 포함)
-
----
-
-## 설치
+### 1. 설치
 
 ```bash
-npm i
+npm install
 cp .env.example .env
-# 실거래 시 .env에 키 입력 및 PAPER=false 설정
 ```
 
----
-
-## 환경 변수
-
-### 빠른 시작용 .env 예시
-
-```env
-# 앱 메타
-APP_NAME=업비트 ML Bot
-APP_VERSION=4.0
-
-# 실행/시장
-MARKET=KRW-BTC
-INTERVAL_MS=1000
-PAPER=true
-TARGET_TRADES_MIN=18
-TARGET_TRADES_MAX=35
-
-# 전략(인트라데이 프리셋)
-TP=0.012
-SL=0.015
-FEE=0.0005
-SLIP=0.0003
-
-ATR_PERIOD=14
-ATR_P_LO=0.25
-ATR_P_HI=0.80
-MIN_ATR_PCT=0.05
-
-RVOL_BASE_MIN=120
-MIN_RVOL=1.5
-
-TREND_EMA_FAST=20
-TREND_EMA_SLOW=60
-REQUIRE_VWAP_ABOVE=true
-
-MAX_SPREAD_TICKS=2
-MIN_IMB=0.25
-
-TIMEOUT_SEC=2400
-STALL_SEC=1200
-BE_TRIGGER=0.006
-BE_OFFSET=0.002
-TRAIL_PCT=0.005
-
-# 로그/UI
-LOG_DIR=./logs
-TRADE_LOG=trades.jsonl
-SHOW_GLOSSARY=true
-USE_ALT_SCREEN=true
-MIN_RENDER_MS=120
-
-# 실거래 키(PAPER=false일 때 필수)
-UPBIT_ACCESS_KEY=
-UPBIT_SECRET_KEY=
-
-ML_ENABLED=true
-ML_USE_OB_FEATURES=true
-ML_MODEL_PATH_OB=./logs/ml_model_ob.json
-```
-
-### 환경 변수 표
-
-| 키                            | 설명                        | 기본값                    |
-| ----------------------------- | --------------------------- | ------------------------- |
-| `APP_NAME`, `APP_VERSION`     | 대시보드 타이틀             | 업비트 ML Bot, 4.0        |
-| `MARKET`                      | 거래 마켓                   | `KRW-BTC`                 |
-| `INTERVAL_MS`                 | 루프 간격(ms)               | `300`                     |
-| `PAPER`                       | 모의거래 여부               | `true`                    |
-| `TP`, `SL`                    | 익절·손절(비율)             | `0.0008`, `0.0012`        |
-| `FEE`, `SLIP`                 | 왕복 수수료·평균 슬리피지   | `0.0005`, `0.0003`        |
-| `ATR_PERIOD`                  | ATR 기간(분)                | `14`                      |
-| `ATR_P_LO`, `ATR_P_HI`        | ATR 분위수 하·상한          | `0.25`, `0.70`            |
-| `MIN_ATR_PCT`                 | 최소 ATR%(절대 하한)        | `0.035`                   |
-| `RVOL_BASE_MIN`               | RVOL 기준 구간(분)          | `60`                      |
-| `MIN_RVOL`                    | 최소 RVOL                   | `1.4`                     |
-| `TREND_EMA_FAST/SLOW`         | 5분봉 EMA 15/40             | `15`, `40`                |
-| `REQUIRE_VWAP_ABOVE`          | 가격 ≥ VWAP 요구 여부       | `true`                    |
-| `MAX_SPREAD_TICKS`            | 허용 스프레드 틱            | `1`                       |
-| `MIN_IMB`                     | 최소 호가 불균형(매수 우위) | `0.25`                    |
-| `TIMEOUT_SEC`, `STALL_SEC`    | 보유·스톨 제한(s)           | `22`, `12`                |
-| `BE_TRIGGER/BE_OFFSET`        | 본절 이동 트리거·오프셋     | `0.0005`, `0.0002`        |
-| `TRAIL_PCT`                   | 트레일링 폭                 | `0.0008`                  |
-| `LOG_DIR`, `TRADE_LOG`        | 로그 폴더/파일명            | `./logs`, `trades.jsonl`  |
-| `SHOW_GLOSSARY`               | 용어 설명 표시              | `true`                    |
-| `USE_ALT_SCREEN`              | 대체 화면 버퍼 사용         | `true`                    |
-| `MIN_RENDER_MS`               | 최소 렌더 간격(ms)          | `120`                     |
-| `UPBIT_ACCESS_KEY/SECRET_KEY` | 업비트 API 키               | 빈값                      |
-| `ML_ENABLED`                  | ML 사용 여부                | `true`                    |
-| `ML_USE_OB_FEATURES`          | 오더북 피처 사용            | `true`                    |
-| `ML_MODEL_PATH_OB`            | 오더북 모델 경로            | `./logs/ml_model_ob.json` |
-
-> ⚠️ `TP`, `SL`, `TIMEOUT_SEC`, `STALL_SEC`, `MIN_RVOL`, `MAX_SPREAD_TICKS`, `MIN_IMB` 는 이제 **동적 승률 튜너의 바닥값**입니다. 런타임에서는 ATR·RVOL·호가 상태에 따라 이 값 이상으로 자동 상향되어, 항상 수수료를 제외하고도 “이론상 승률이 최대”인 조합을 사용합니다.
-
----
-
-## 실행
+### 2. 데이터 수집 & 학습
 
 ```bash
-# 모의거래
-node src/index.js
+# 캔들 데이터 수집 (7일, 최소 5000개 필요)
+node scripts/backfill-candles.js --days=7
 
-# 실거래(주의: PAPER=false 필요)
-PAPER=false node src/index.js
+# ML 모델 학습
+node scripts/train-ml-model.js
+
+# (선택) Walk-forward 검증
+node scripts/walkforward-validate.js
+```
+
+### 3. 실행
+
+```bash
+# 모의거래 (기본)
+npm start
+
+# 실거래
+# .env에서 PAPER=false, API 키 설정 후 실행
 ```
 
 ---
 
-## 대시보드 가이드
+## 📊 작동 원리
 
-- **상태/가격**: 보유 여부, 진입가/TP/SL, 현재가
-- **Trend/VWAP**: 5분 EMA20/50, VWAP, 패스/실패 표시
-- **ATR/RVOL/Orderbook**: 현재 값 vs 목표치, 부족 항목 상세
-- **스코어**: RSI/RVOL/Orderbook/Candle 막대 그래프
-- **확률**: (p)와 (p^\*) 및 차이(±%)
-- **포지션 타이머**: 보유시간, 타임아웃 잔여
-- **최근 체결 10건**: 사유와 P&L
-- **누적 성과**: 건수·승/패·승률·누적 P&L
-- **용어 설명**: RSI, RVOL, Orderbook(imb, spreadT, b1/a1), Candle, EMA, VWAP, (p)/(p^\*), TIMEOUT 등
-
-> 깜빡임 저감: 대체 화면 버퍼, 커서 숨김, **부분 지우기**, **프레임 최소 간격** 사용
-
----
-
-## 전략 상세
-
-### 진입 조건
-
-기본적으로 아래 조건을 충족해야 하며, 강한 체결 신호가 감지되면 “모멘텀 오버라이드” 규칙으로 일부 필터를 건너뛸 수 있습니다.
-
-- **기본 경로**
-
-  1. **ATR%**: `MIN_ATR_PCT` 이상 **AND** 분위수 구간 `[ATR_P_LO, ATR_P_HI]`
-  2. **RVOL**: `avg(최근 5분) / avg(최근 120분) ≥ MIN_RVOL`
-  3. **추세/VWAP**: 5분봉 `EMA20 > EMA50` **AND** (옵션) `가격 ≥ VWAP`
-  4. **호가창**: `imbalance ≥ MIN_IMB` **AND** `spreadTicks ≤ MAX_SPREAD_TICKS`
-  5. **확률 임계**: `p ≥ p*`
-     (p^\*=\frac{\text{SL}+\text{FEE}+\text{SLIP}}{\text{TP}+\text{SL}})
-
-- **모멘텀 오버라이드**
-  - `OrderbookScore ≥ 0.8` 이면서 `ATR 밴드` 또는 `RVOL ≥ 1.6`이면, 추세/VWAP 필터 없이도 진입 가능
-
-### 청산 우선순위
-
-1. **손절(SL)**: −0.28% (동적 비율 적용)
-2. **익절(TP)**: +0.15%
-3. **본절 이동(BE)**: +0.05% 도달 시 손절을 진입가(+0.025%) 근처로 이동
-4. **트레일링(TRAIL)**: 고점 대비 −0.12% 이탈 시 청산
-5. **스톨(STALL)**: `STALL_SEC`(기본 14초, 동적 6~30초) 동안 BE 위로 복귀하지 못하면 강제 정리
-6. **타임아웃**: `TIMEOUT_SEC`(기본 26초, 동적 15~50초) 경과 시 시장가 정리
-
-### 승률 지향 자동 튜너 (Win-Bias Optimizer)
-
-봇이 루프를 돌 때마다 **ATR%·RVOL·호가 스프레드/imbalance**를 입력으로 받아, “수수료를 제하고도 승률이 가장 높아지는” 방향으로 파라미터를 재설정합니다.
-
-- **TP/SL 재계산**: ATR·수수료를 반영해 `TP ≈ 0.12~0.36%`, `SL ≈ TP×(1.3~2.0)` 범위로 산출해 일반적인 스캘핑 손익비를 유지합니다.
-- **p\*** 업데이트: 새 TP/SL 값을 즉시 반영해 `p* = (SL+FEE+SLIP)/(TP+SL)`를 계산하고, 승률 임계치를 **0.55~0.72** 사이로 자동 제한합니다.
-- **시간 제한**: 예상 도달 시간(`TP / ATR`)을 역산해 STALL/TIMEOUT을 6~24초, 14~40초 범위에서 조정합니다.
-- **필터 조정**: RVOL/스프레드/imb 바닥값을 시장 강도에 따라 동적으로 1.12~1.65배, 1~2틱, 0.20~0.40으로 맞춰 일반 스캘핑 빈도를 확보합니다.
-- **대시보드/로그 연동**: 새 목표치는 `🎯 목표(동적)`과 Glossary의 `p*`에 즉시 반영되며, 체결 로그(`entryCtx.targets`)에 그대로 남습니다.
-
-따라서 `.env` 값은 “최소한 이 정도는 지켜라”는 바닥선으로만 쓰이며, 실거래에서는 항상 이론상 승률이 우위인 조합으로 자동 운용됩니다.
-
-### 운영 프로파일(권장값)
-
-| 프로파일     | 건수/일 | 승률 목표 | MIN_ATR% | MIN_RVOL | VWAP필터 | MIN_IMB | MAX_SPREAD | p 조건        |
-| ------------ | ------: | --------: | -------: | -------: | -------- | ------: | ---------: | ------------- |
-| 초단타(기본) |   12–20 |    63–68% |    0.055 |      1.6 | on       |    0.20 |          2 | `p ≥ p*+0.01` |
-| 보수         |    6–10 |    62–66% |     0.06 |      1.7 | on       |    0.25 |          2 | `p ≥ p*+0.03` |
-| 중립         |   10–18 |    60–63% |     0.05 |      1.4 | on       |    0.18 |          3 | `p ≥ p*+0.01` |
-| 공격         |   18–30 |    56–60% |     0.04 |      1.1 | off      |    0.10 |          4 | `p ≥ p*−0.01` |
-
----
-
-## 폴더 구조
+### 진입 조건 (모두 충족 시)
 
 ```
-.
+1. ML 확률: p ≥ p* (예: 60% ≥ 58% → 충족)
+2. 오더북: 스프레드 ≤ 2틱, 매수불균형 ≥ 28%
+3. 거래량: RVOL ≥ 1.5배
+4. 추세: EMA20 > EMA50, 가격 > VWAP
+```
+
+### 확률 계산
+
+```
+p  = ML 모델 예측값 (로지스틱 회귀: 1 / (1 + e^(-z)))
+p* = SL / (TP + SL)  ← 손익분기 승률 (Kelly Criterion)
+
+예) TP=0.8%, SL=0.5% → p* = 0.5 / 1.3 = 38.5%
+```
+
+### 청산 조건 (우선순위)
+
+| 순위 | 조건          | 설명                           |
+| ---- | ------------- | ------------------------------ |
+| 1    | **손절 (SL)** | -0.5% 도달                     |
+| 2    | **익절 (TP)** | +0.8% 도달                     |
+| 3    | **본절 (BE)** | +0.3% 후 손절선을 +0.1%로 이동 |
+| 4    | **트레일링**  | 고점 대비 -0.2% 이탈           |
+| 5    | **스톨**      | 10분간 BE 미도달 시 정리       |
+| 6    | **타임아웃**  | 30분 경과 시 강제 정리         |
+
+---
+
+## ⚙️ 주요 환경 변수
+
+### 필수 설정
+
+| 변수               | 설명             | 기본값    |
+| ------------------ | ---------------- | --------- |
+| `MARKET`           | 거래 마켓        | `KRW-BTC` |
+| `PAPER`            | 모의거래 여부    | `true`    |
+| `UPBIT_ACCESS_KEY` | 업비트 API 키    | -         |
+| `UPBIT_SECRET_KEY` | 업비트 시크릿 키 | -         |
+
+### 리스크 관리
+
+| 변수                          | 설명                | 기본값         |
+| ----------------------------- | ------------------- | -------------- |
+| `POSITION_PCT_MAX`            | 포지션 최대 비중    | `0.25` (25%)   |
+| `MAX_ORDER_KRW`               | 최대 주문 금액      | `1,000,000`    |
+| `MAX_DAILY_LOSSES`            | 일일 최대 손실 횟수 | `5`            |
+| `DAILY_LOSS_LIMIT_PCT`        | 일일 최대 손실 비율 | `0.025` (2.5%) |
+| `MAX_CONSECUTIVE_LOSSES`      | 연속 손실 허용      | `3`            |
+| `COOLDOWN_AFTER_LOSS_MINUTES` | 손실 후 휴식        | `30분`         |
+
+### TP/SL 설정
+
+| 변수          | 설명      | 기본값         |
+| ------------- | --------- | -------------- |
+| `TP`          | 익절 비율 | `0.008` (0.8%) |
+| `SL`          | 손절 비율 | `0.005` (0.5%) |
+| `TIMEOUT_SEC` | 타임아웃  | `1800` (30분)  |
+| `STALL_SEC`   | 스톨 시간 | `600` (10분)   |
+
+### ML 설정
+
+| 변수             | 설명             | 기본값 |
+| ---------------- | ---------------- | ------ |
+| `ML_ENABLED`     | ML 사용 여부     | `true` |
+| `ML_MIN_PROB`    | 최소 확률 임계치 | `0.58` |
+| `ML_TP_ATR_MULT` | TP ATR 배수      | `1.5`  |
+| `ML_SL_ATR_MULT` | SL ATR 배수      | `1.0`  |
+
+> 전체 설정은 `.env.example` 참조
+
+---
+
+## 📁 폴더 구조
+
+```
 ├─ src/
-│  ├─ api/               # Upbit REST 어댑터(JWT 주문 등)
-│  ├─ config/            # .env 로딩 및 CFG
-│  ├─ core/              # 스로틀/백오프 등 코어 유틸
-│  ├─ executor/          # 진입·청산(BE/Trail/Timeout)
-│  ├─ monitor/           # 대시보드/로거(깜빡임 저감)
-│  ├─ util/              # 수학/시간/틱 유틸
-│  └─ index.js           # 메인 루프
+│  ├─ index.js          # 메인 루프
+│  ├─ config/           # 환경 설정
+│  ├─ ml/               # ML 모델 (로지스틱 회귀)
+│  ├─ strategy/         # 진입 조건 로직
+│  ├─ executor/         # 주문 실행/청산
+│  ├─ monitor/          # 대시보드
+│  └─ api/              # 업비트 API
 ├─ scripts/
-│  ├─ backfill-candles.js
-│  ├─ train-ml-model.js
-│  ├─ train-ml-trades.js
-│  └─ walkforward-validate.js
+│  ├─ backfill-candles.js      # 캔들 데이터 수집
+│  ├─ train-ml-model.js        # 모델 학습
+│  ├─ train-ml-trades.js       # 거래 기반 학습
+│  └─ walkforward-validate.js  # 검증
 ├─ logs/
-│  └─ trades.jsonl       # 체결 로그(JSON Lines)
-├─ .env.example
-└─ README.md
+│  ├─ candles_1m.jsonl         # 캔들 데이터
+│  ├─ trades_intraday.jsonl    # 거래 기록
+│  └─ ml_model.json            # 학습된 모델
+└─ .env.example
 ```
 
 ---
 
-## v2.0 → v3.0 마이그레이션
+## 🔧 트러블슈팅
 
-- **ENV 키 변경**
-
-  - `STOP_LOSS_PERCENT` → `SL`
-  - `QUICK_PROFIT_PERCENT` → `TP`
-  - 수수료/슬리피지 → `FEE`, `SLIP`
-  - `MIN_ATR_THRESHOLD` → `MIN_ATR_PCT`
-  - 호가창: `MAX_SPREAD_TICKS`, `MIN_IMB` 도입
-
-- **신규 키**
-
-  - `ATR_P_LO`, `ATR_P_HI`, `RVOL_BASE_MIN`, `REQUIRE_VWAP_ABOVE`
-  - `TIMEOUT_SEC`, `STALL_SEC`, `BE_TRIGGER`, `BE_OFFSET`, `TRAIL_PCT`
-  - UI: `USE_ALT_SCREEN`, `MIN_RENDER_MS`, `SHOW_GLOSSARY`
-
-- **대시보드**: 용어 설명 패널, 최근 10건, 승률/누적 P&L
+| 문제                   | 해결                                             |
+| ---------------------- | ------------------------------------------------ |
+| "ML 모델 없음"         | `node scripts/train-ml-model.js` 실행            |
+| "ML 피처 부족"         | `node scripts/backfill-candles.js --days=7` 실행 |
+| "데이터 부족 (5000개)" | 백필 기간 늘리기: `--days=14`                    |
+| p가 항상 낮음          | 정상. 횡보장에서는 1~5%, 모멘텀 발생 시 급상승   |
+| HTTP 429 에러          | API 호출 과다. 잠시 대기                         |
 
 ---
 
-## 트러블슈팅
+## ⚠️ 면책
 
-- **HTTP 429**: 호출 과다. 분석시 `--rps` 낮추고, 실시간 모듈은 내부 스로틀·백오프 사용.
-- **주문 401/422**: API 키 권한, IP 화이트리스트, JWT 서명(`query_hash`) 확인.
-- **터미널 깜빡임**: `USE_ALT_SCREEN=true`, `MIN_RENDER_MS≥120`. 외부 터미널 권장.
-
----
-
-## 면책
-
-본 코드는 교육·연구 목적입니다. **실거래 책임은 사용자에게 있습니다.**
-실거래 전 반드시 **PAPER=true**로 충분히 검증하세요.
+본 코드는 **교육·연구 목적**입니다.  
+**실거래 손실에 대한 책임은 사용자에게 있습니다.**  
+실거래 전 반드시 `PAPER=true`로 충분히 검증하세요.
 
 ---
 
-## 라이선스
+## 📜 라이선스
 
 MIT License

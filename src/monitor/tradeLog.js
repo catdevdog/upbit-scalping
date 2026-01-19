@@ -2,13 +2,16 @@
 // - ENTRY/EXIT 이벤트를 한 줄 JSON으로 기록
 // - 대시보드에서 최근 10건·승률 통계에 사용
 // - [Update] 메모리 캐싱 도입으로 I/O 병목 제거
+// - [개선 7] LRU 방식 메모리 캐시 제한 (최대 1000건)
 
 import fs from "fs";
 import { PATHS } from "../config/index.js";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 메모리 캐시 (싱글톤)
+// 개선 7: 메모리 캐시 제한 (LRU 방식)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const MAX_CACHE_SIZE = 1000; // 최근 1000건만 유지
+
 let _eventsCache = null;
 
 export function ensureLogDir() {
@@ -24,7 +27,7 @@ function loadCacheIfNeeded() {
     if (fs.existsSync(PATHS.tradeLog)) {
       const text = fs.readFileSync(PATHS.tradeLog, "utf8");
       const lines = text.split(/\r?\n/).filter(Boolean);
-      _eventsCache = lines
+      const parsed = lines
         .map((l) => {
           try {
             return JSON.parse(l);
@@ -33,6 +36,9 @@ function loadCacheIfNeeded() {
           }
         })
         .filter(Boolean);
+
+      // 개선 7: 최근 N건만 메모리에 유지
+      _eventsCache = parsed.slice(-MAX_CACHE_SIZE);
     }
   } catch (e) {
     console.error("TradeLog load error:", e);
@@ -43,9 +49,15 @@ export function appendTrade(event) {
   try {
     ensureLogDir();
 
-    // 1. 메모리 업데이트
+    // 1. 메모리 업데이트 (개선 7: LRU 방식)
     loadCacheIfNeeded();
-    if (_eventsCache) _eventsCache.push(event);
+    if (_eventsCache) {
+      _eventsCache.push(event);
+      // 캐시 크기 제한
+      if (_eventsCache.length > MAX_CACHE_SIZE) {
+        _eventsCache = _eventsCache.slice(-MAX_CACHE_SIZE);
+      }
+    }
 
     // 2. 파일 쓰기 (비동기)
     const line = JSON.stringify(event) + "\n";

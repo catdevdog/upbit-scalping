@@ -189,8 +189,9 @@ function shuffleInPlace(X, y) {
 
 async function main() {
   const rows = parseJsonl(input).sort((a, b) => a.ts - b.ts);
-  if (rows.length < 500) {
-    throw new Error("데이터가 부족합니다. 최소 500개 이상 필요합니다.");
+  // 개선 4: 최소 데이터 요구량 500 → 5000으로 증가
+  if (rows.length < 5000) {
+    throw new Error("데이터가 부족합니다. 최소 5,000개 이상 필요합니다.");
   }
 
   const featureWindow = Number(CFG.ml.featureWindow ?? 120);
@@ -216,7 +217,8 @@ async function main() {
     y.push(label);
   }
 
-  if (X.length < 200) {
+  // 개선 4: 최소 학습 샘플 200 → 1000으로 증가
+  if (X.length < 1000) {
     throw new Error(
       "학습 가능한 샘플이 부족합니다. 조건을 완화하거나 기간을 늘려주세요."
     );
@@ -224,7 +226,8 @@ async function main() {
 
   const timeSplit = CFG.ml.timeSplit !== false;
   if (!timeSplit) shuffleInPlace(X, y);
-  const split = Math.floor(X.length * 0.8);
+  // 개선 4: 학습/검증 분리 비율 80/20 → 70/30으로 검증 강화
+  const split = Math.floor(X.length * 0.7);
   const Xtrain = X.slice(0, split);
   const ytrain = y.slice(0, split);
   const Xval = X.slice(split);
